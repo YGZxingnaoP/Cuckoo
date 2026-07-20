@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Embedded Python runtime (不提交运行时)
+runtime/
+
+# IDE
+.idea/
+.vs/
+*.sln
+*.suo
+*.user
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
+
+# Temp files
+*.part
+*.tmp

@@ -1,0 +1,618 @@
+# -*- coding: utf-8 -*-
+"""
+主窗口（控制层）
+星型拓扑架构：
+  - 房主：运行 Server + ScreenHost + AudioMixer + HostFileHandler
+  - 房客：运行 ClientConnection + ScreenGuest + GuestAudio
+协调所有功能模块的启停，接收信号更新界面。
+"""
+
+import os
+import sys
+import struct
+import threading
+from typing import Optional
+
+from PySide6.QtWidgets import (
+    QMainWindow, QTabWidget, QPushButton,
+    QMessageBox, QStatusBar, QHBoxLayout, QWidget
+)
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QPixmap
+
+import config
+from common import logger as log
+from common import network
+
+# 核心模块
+from core.server import Server
+from core.client import ClientConnection
+from core.protocol import (
+    NicknameRegistry,
+    MSG_TEXT, MSG_FILE_META, MSG_FILE_CHUNK, MSG_SCREEN_FRAME, MSG_COMMAND,
+    CMD_SCREEN_START, CMD_SCREEN_STOP, HOST_ID, BROADCAST_ID,
+    build_frame
+)
+
+# UI Tabs
+from ui.tabs.screen_tab import ScreenTab
+from ui.tabs.voice_tab import VoiceTab
+from ui.tabs.file_tab import FileTab
+from ui.tabs.chat_tab import ChatTab
+
+# 功能模块
+from func.screen_share.host import ScreenHost
+from func.screen_share.guest import ScreenGuest
+from func.voice_chat.mixer import AudioMixer
+from func.voice_chat.guest_audio import GuestAudio
+from func.file_transfer.host_file import HostFileHandler
+
+TAG = "MainWindow"
+
+
+class MainWindow(QMainWindow):
+    """
+    应用主窗口。
+    负责：
+    1. 创建 QTabWidget 布局
+    2. 根据角色创建 Server（房主）或 ClientConnection（房客）
+    3. 注册消息处理器，协调功能模块
+    4. 管理生命周期
+    """
+
+    def __init__(self, is_host: bool, peer_ip: str = "", nickname: str = ""):
+        super().__init__()
+        self._is_host = is_host
+        self._peer_ip = peer_ip
+        self._nickname = nickname
+        self._role_name = "房主" if is_host else "房客"
+
+        # 昵称注册表
+        self._nicknames = NicknameRegistry()
+        self._nicknames.set(HOST_ID, nickname if is_host else "房主")
+        self._my_id = HOST_ID if is_host else -1
+
+        # 核心模块实例
+        self._server: Optional[Server] = None
+        self._client: Optional[ClientConnection] = None
+
+        # 功能模块实例
+        self._screen_host: Optional[ScreenHost] = None
+        self._screen_guest: Optional[ScreenGuest] = None
+        self._audio_mixer: Optional[AudioMixer] = None
+        self._guest_audio: Optional[GuestAudio] = None
+        self._host_file: Optional[HostFileHandler] = None
+
+        # 主机麦克风采集线程
+        self._host_mic_running = False
+        self._host_mic_thread: Optional[threading.Thread] = None
+
+        self._init_ui()
+        self._start_services()
+
+    # ═════════════════════════════════════════
+    # UI 构建
+    # ═════════════════════════════════════════
+
+    def _init_ui(self) -> None:
+        self.setWindowTitle(f"Cuckoo — {self._role_name}模式")
+        self.resize(config.WINDOW_WIDTH, config.WINDOW_HEIGHT)
+
+        central = QWidget()
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        self._tabs = QTabWidget()
+        self._tabs.setObjectName("mainTabs")
+
+        # Tab 1: 投屏
+        self._screen_tab = ScreenTab(is_host=self._is_host)
+        self._tabs.addTab(self._screen_tab, "投屏")
+
+        # Tab 2: 语音
+        self._voice_tab = VoiceTab()
+        self._tabs.addTab(self._voice_tab, "语音")
+
+        # Tab 3: 文件
+        self._file_tab = FileTab()
+        self._tabs.addTab(self._file_tab, "文件")
+
+        # Tab 4: 文字
+        self._chat_tab = ChatTab()
+        self._tabs.addTab(self._chat_tab, "文字")
+
+        main_layout.addWidget(self._tabs)
+        self.setCentralWidget(central)
+
+        # ── 状态栏 ──
+        self._status_bar = QStatusBar()
+        self.setStatusBar(self._status_bar)
+        self._status_bar.showMessage(f"角色：{self._role_name} ({self._nickname})")
+
+        # 在线状态检测按钮（仅房客）
+        if not self._is_host:
+            self._btn_probe = QPushButton("检测在线状态")
+            self._btn_probe.setObjectName("btnProbe")
+            self._btn_probe.clicked.connect(self._on_probe)
+            self._status_bar.addPermanentWidget(self._btn_probe)
+
+        # ── 信号绑定 ──
+        self._screen_tab.toggle_requested.connect(self._on_toggle_screen)
+        self._voice_tab.toggle_mic_requested.connect(self._on_toggle_mic)
+        self._chat_tab.send_requested.connect(self._on_chat_send)
+        self._file_tab.file_send_requested.connect(self._on_file_send)
+        self._file_tab.folder_send_requested.connect(self._on_folder_send)
+
+    # ═════════════════════════════════════════
+    # 服务启动
+    # ═════════════════════════════════════════
+
+    def _start_services(self) -> None:
+        """根据角色启动服务。"""
+        if self._is_host:
+            self._start_host_services()
+        else:
+            self._start_guest_services()
+
+    # ─────────────────────────────────────────
+    # 房主服务
+    # ─────────────────────────────────────────
+
+    def _start_host_services(self) -> None:
+        """房主：启动 TCP 服务器 + UDP 混音器。"""
+        try:
+            # 创建 Server
+            self._server = Server(host_nickname=self._nickname)
+            self._server.set_on_client_joined(self._on_client_joined)
+            self._server.set_on_client_left(self._on_client_left)
+
+            # 注册文本消息处理器
+            self._server.register_handler(MSG_TEXT, self._handle_text)
+
+            # 创建投屏模块
+            self._screen_host = ScreenHost(self._server)
+
+            # 创建混音器
+            self._audio_mixer = AudioMixer(self._server)
+            self._audio_mixer.start()
+
+            # 创建文件处理器
+            self._host_file = HostFileHandler(self._server)
+            self._host_file.progress.connect(self._file_tab.update_progress)
+            self._host_file.file_complete.connect(self._on_file_complete)
+            self._host_file.status_changed.connect(self._file_tab.set_status)
+
+            # 启动服务器
+            self._server.start()
+
+            # 初始化聊天
+            self._my_id = HOST_ID
+            self._chat_tab.setup(HOST_ID, self._nicknames)
+
+            self._status_bar.showMessage("房间已创建 — 等待房客加入")
+            log.log(TAG, "Host services started")
+
+        except OSError as e:
+            log.error(TAG, f"Port bind failed: {e}")
+            QMessageBox.critical(self, "端口错误", f"端口绑定失败：{e}\n请检查防火墙设置或端口是否被占用。")
+            sys.exit(1)
+
+    def _on_client_joined(self, uid: int, nickname: str) -> None:
+        """房客加入回调（从 Server 线程调用）。"""
+        self._nicknames.set(uid, nickname)
+        self._chat_tab.append_system(f"{nickname} 加入了房间")
+        self._update_file_targets()
+        self._status_bar.showMessage(f"{nickname} 加入 — 当前 {len(self._server.clients)} 人在线")
+
+    def _on_client_left(self, uid: int, nickname: str) -> None:
+        """房客离开回调。"""
+        self._nicknames.remove(uid)
+        if self._audio_mixer:
+            self._audio_mixer.unregister_client(uid)
+        self._chat_tab.append_system(f"{nickname} 离开了房间")
+        self._update_file_targets()
+        if self._server:
+            self._status_bar.showMessage(f"{nickname} 离开 — 当前 {len(self._server.clients)} 人在线")
+
+    def _update_file_targets(self) -> None:
+        """更新文件发送目标列表。"""
+        targets = {}
+        for uid, info in self._server.clients.items():
+            targets[uid] = info.nickname or f"房客{uid}"
+        self._file_tab.update_targets(targets)
+
+    # ─────────────────────────────────────────
+    # 房客服务
+    # ─────────────────────────────────────────
+
+    def _start_guest_services(self) -> None:
+        """房客：连接房主。"""
+        try:
+            # 创建 ClientConnection
+            self._client = ClientConnection(self._peer_ip, self._nickname)
+
+            # 连接信号
+            self._client.joined.connect(self._on_joined)
+            self._client.user_list.connect(self._on_user_list)
+            self._client.user_joined.connect(self._on_user_joined)
+            self._client.user_left.connect(self._on_user_left)
+            self._client.frame_received.connect(self._on_frame_received)
+            self._client.disconnected.connect(self._on_disconnected)
+
+            # 创建投屏接收器
+            self._screen_guest = ScreenGuest()
+            self._screen_guest.frame_ready.connect(self._screen_tab.update_frame)
+            self._screen_guest.start()
+
+            # 连接到房主
+            self._client.connect_to_host()
+
+            self._status_bar.showMessage("正在连接房主...")
+            log.log(TAG, "Guest services starting")
+
+        except (ConnectionRefusedError, OSError) as e:
+            log.error(TAG, f"Connection failed: {e}")
+            QMessageBox.critical(self, "连接失败", f"无法连接房主：{e}")
+            sys.exit(1)
+
+    def _on_joined(self, assigned_id: int, nickname: str) -> None:
+        """成功加入房间。"""
+        self._my_id = assigned_id
+        self._nicknames.set(assigned_id, nickname)
+        self._chat_tab.setup(assigned_id, self._nicknames)
+        self._chat_tab.append_system(f"已加入房间，你的ID是 {assigned_id}")
+
+        # 初始化音频（但不开启麦克风）
+        self._guest_audio = GuestAudio(self._peer_ip, assigned_id)
+
+        self._status_bar.showMessage(f"已连接房主 — ID: {assigned_id}")
+        log.log(TAG, f"Joined as ID={assigned_id}")
+
+    def _on_user_list(self, users: dict) -> None:
+        """收到在线用户列表。"""
+        for uid, nick in users.items():
+            self._nicknames.set(uid, nick)
+        self._update_guest_file_targets(users)
+
+    def _on_user_joined(self, uid: int, nickname: str) -> None:
+        """新用户加入通知。"""
+        self._nicknames.set(uid, nickname)
+        self._chat_tab.append_system(f"{nickname} 加入了房间")
+        # 更新目标列表
+        all_users = self._nicknames.get_all()
+        all_users.pop(self._my_id, None)
+        self._file_tab.update_targets(all_users)
+
+    def _on_user_left(self, uid: int, nickname: str) -> None:
+        """用户离开通知。"""
+        self._nicknames.remove(uid)
+        self._chat_tab.append_system(f"{nickname} 离开了房间")
+        all_users = self._nicknames.get_all()
+        all_users.pop(self._my_id, None)
+        self._file_tab.update_targets(all_users)
+
+    def _update_guest_file_targets(self, users: dict) -> None:
+        """房客端更新文件目标（排除自己）。"""
+        targets = {uid: nick for uid, nick in users.items() if uid != self._my_id}
+        self._file_tab.update_targets(targets)
+
+    def _on_disconnected(self) -> None:
+        """连接断开。"""
+        self._status_bar.showMessage("与房主断开连接")
+        self._screen_tab.stop_streaming()
+        QMessageBox.warning(self, "连接断开", "与房主的连接已断开。")
+
+    # ═════════════════════════════════════════
+    # 帧处理（房客端）
+    # ═════════════════════════════════════════
+
+    def _on_frame_received(self, msg_type: int, sender_id: int, target_id: int, payload: bytes) -> None:
+        """房客收到帧（由 ClientConnection 分发）。"""
+        if msg_type == MSG_TEXT:
+            self._handle_text_guest(sender_id, payload)
+        elif msg_type == MSG_SCREEN_FRAME:
+            if self._screen_guest:
+                self._screen_guest.push_frame_data(payload)
+        # MSG_FILE_META / MSG_FILE_CHUNK 暂由简单处理（未来可扩展为 GuestFileReceiver）
+
+    def _handle_text_guest(self, sender_id: int, payload: bytes) -> None:
+        """房客处理文本消息。"""
+        try:
+            text = payload.decode("utf-8")
+            self._chat_tab.append_message(sender_id, text)
+        except UnicodeDecodeError:
+            log.warn(TAG, "Discarded non-UTF-8 text message")
+
+    # ═════════════════════════════════════════
+    # 文本消息处理（房主端）
+    # ═════════════════════════════════════════
+
+    def _handle_text(self, msg_type: int, sender_id: int, target_id: int, payload: bytes) -> None:
+        """房主收到文本消息 → 广播给所有人。"""
+        # 广播给其他房客
+        broadcast_frame = build_frame(MSG_TEXT, sender_id, BROADCAST_ID, payload)
+        self._server.broadcast(broadcast_frame, exclude={sender_id})
+        # 房主自己也显示
+        try:
+            text = payload.decode("utf-8")
+            self._chat_tab.append_message(sender_id, text)
+        except UnicodeDecodeError:
+            pass
+
+    # ═════════════════════════════════════════
+    # 事件处理
+    # ═════════════════════════════════════════
+
+    def _on_toggle_screen(self) -> None:
+        """房主投屏开关。"""
+        if not self._is_host:
+            return
+        if self._screen_host and self._screen_host.running:
+            self._screen_host.stop()
+            self._screen_tab.stop_streaming()
+            # 发送停止投屏信令
+            if self._server:
+                stop_frame = build_frame(MSG_COMMAND, HOST_ID, BROADCAST_ID,
+                                         bytes([CMD_SCREEN_STOP]))
+                self._server.broadcast(stop_frame)
+            log.log(TAG, "Screen sharing stopped")
+        else:
+            if self._screen_host:
+                self._screen_host.start()
+                self._screen_tab.start_streaming()
+                # 发送开始投屏信令
+                if self._server:
+                    start_frame = build_frame(MSG_COMMAND, HOST_ID, BROADCAST_ID,
+                                              bytes([CMD_SCREEN_START]))
+                    self._server.broadcast(start_frame)
+                log.log(TAG, "Screen sharing started")
+            else:
+                QMessageBox.warning(self, "提示", "服务器尚未就绪。")
+
+    def _on_toggle_mic(self) -> None:
+        """麦克风开关。"""
+        if self._is_host:
+            self._toggle_host_mic()
+        else:
+            self._toggle_guest_mic()
+
+    def _toggle_host_mic(self) -> None:
+        """房主麦克风切换。"""
+        if self._host_mic_running:
+            self._host_mic_running = False
+            self._voice_tab.set_mic_off()
+            if self._host_mic_thread:
+                self._host_mic_thread.join(timeout=3)
+            log.log(TAG, "Host mic off")
+        else:
+            if not self._audio_mixer:
+                QMessageBox.warning(self, "提示", "混音器未就绪。")
+                return
+            self._host_mic_running = True
+            self._voice_tab.set_mic_on()
+            self._host_mic_thread = threading.Thread(
+                target=self._host_mic_loop, daemon=True, name="HostMic"
+            )
+            self._host_mic_thread.start()
+            log.log(TAG, "Host mic on")
+
+    def _host_mic_loop(self) -> None:
+        """房主麦克风采集循环。"""
+        import pyaudio
+        try:
+            pa = pyaudio.PyAudio()
+            stream = pa.open(
+                format=pyaudio.paInt16,
+                channels=config.AUDIO_CHANNELS,
+                rate=config.AUDIO_RATE,
+                input=True,
+                frames_per_buffer=config.AUDIO_CHUNK
+            )
+            while self._host_mic_running:
+                pcm = stream.read(config.AUDIO_CHUNK, exception_on_overflow=False)
+                if self._audio_mixer:
+                    self._audio_mixer.push_host_audio(pcm)
+            stream.stop_stream()
+            stream.close()
+            pa.terminate()
+        except Exception as e:
+            log.error(TAG, f"Host mic error: {e}")
+            self._host_mic_running = False
+
+    def _toggle_guest_mic(self) -> None:
+        """房客麦克风切换。"""
+        if not self._guest_audio:
+            QMessageBox.warning(self, "提示", "尚未加入房间。")
+            return
+        if self._guest_audio.mic_on:
+            self._guest_audio.stop()
+            self._voice_tab.set_mic_off()
+            log.log(TAG, "Guest mic off")
+        else:
+            if self._guest_audio.start_mic():
+                self._voice_tab.set_mic_on()
+                log.log(TAG, "Guest mic on")
+            else:
+                QMessageBox.warning(self, "音频错误", "无法开启音频设备。")
+
+    def _on_chat_send(self, text: str) -> None:
+        """发送文本消息。"""
+        data = text.encode("utf-8")
+        if self._is_host and self._server:
+            # 房主：直接广播
+            frame = build_frame(MSG_TEXT, HOST_ID, BROADCAST_ID, data)
+            self._server.broadcast(frame)
+        elif self._client:
+            # 房客：发送给房主，由房主广播
+            self._client.send_frame(MSG_TEXT, HOST_ID, data)
+
+    def _on_file_send(self, file_path: str, target_id: int) -> None:
+        """发送文件。"""
+        if self._is_host and self._host_file:
+            self._host_file.send_file(file_path, target_id)
+        elif self._client:
+            # 房客发送文件（通过 ClientConnection 发给房主中转）
+            self._guest_send_file(file_path, target_id)
+
+    def _on_folder_send(self, folder_path: str, target_id: int) -> None:
+        """发送文件夹。"""
+        if self._is_host and self._host_file:
+            self._host_file.send_folder(folder_path, target_id)
+        elif self._client:
+            self._guest_send_folder(folder_path, target_id)
+
+    def _guest_send_file(self, file_path: str, target_id: int) -> None:
+        """房客发送文件给指定用户（通过房主中转）。"""
+        import threading
+        threading.Thread(
+            target=self._guest_file_loop,
+            args=(file_path, target_id, ""),
+            daemon=True, name="GuestFileSend"
+        ).start()
+
+    def _guest_send_folder(self, folder_path: str, target_id: int) -> None:
+        """房客发送文件夹给指定用户（通过房主中转）。"""
+        import threading
+        threading.Thread(
+            target=self._guest_folder_loop,
+            args=(folder_path, target_id),
+            daemon=True, name="GuestFolderSend"
+        ).start()
+
+    def _guest_file_loop(self, file_path: str, target_id: int, base_name: str = "") -> None:
+        """房客文件发送循环。"""
+        try:
+            filename = os.path.basename(file_path)
+            file_size = os.path.getsize(file_path)
+            name_bytes = filename.encode("utf-8")
+            base_bytes = base_name.encode("utf-8")
+
+            # 元数据: [4B base_name_len][base_name][4B name_len][name][8B size][4B target_id]
+            meta = bytearray()
+            meta.extend(struct.pack("!I", len(base_bytes)))
+            meta.extend(base_bytes)
+            meta.extend(struct.pack("!I", len(name_bytes)))
+            meta.extend(name_bytes)
+            meta.extend(struct.pack("!Q", file_size))
+            meta.extend(struct.pack("!I", target_id))
+
+            self._client.send_frame(MSG_FILE_META, HOST_ID, bytes(meta))
+
+            display = f"{base_name}/{filename}" if base_name else filename
+            self._file_tab.set_status(f"正在发送: {display}")
+
+            # 数据块
+            import time
+            with open(file_path, "rb") as f:
+                while True:
+                    chunk = f.read(config.FILE_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    self._client.send_frame(MSG_FILE_CHUNK, target_id, chunk)
+                    time.sleep(config.FILE_SEND_DELAY)
+
+            self._file_tab.set_status(f"发送完成: {display}")
+            self._file_tab.update_progress(100, "完成", "")
+            log.log(TAG, f"File sent: {display} to {target_id}")
+
+        except OSError as e:
+            log.error(TAG, f"File send error: {e}")
+            self._file_tab.set_status(f"发送失败: {e}")
+
+    def _guest_folder_loop(self, folder_path: str, target_id: int) -> None:
+        """房客文件夹发送循环（遍历文件夹逐个发送）。"""
+        folder_name = os.path.basename(folder_path)
+        file_list = []
+        for root, dirs, files in os.walk(folder_path):
+            for fname in files:
+                full_path = os.path.join(root, fname)
+                rel_path = os.path.relpath(full_path, folder_path)
+                file_list.append((full_path, rel_path))
+
+        total = len(file_list)
+        self._file_tab.set_status(f"正在发送文件夹: {folder_name} ({total} 个文件)")
+        log.log(TAG, f"Sending folder '{folder_name}' with {total} files to {target_id}")
+
+        import time
+        for idx, (full_path, rel_path) in enumerate(file_list, 1):
+            try:
+                file_size = os.path.getsize(full_path)
+                rel_bytes = rel_path.encode("utf-8")
+                base_bytes = folder_name.encode("utf-8")
+
+                # 元数据
+                meta = bytearray()
+                meta.extend(struct.pack("!I", len(base_bytes)))
+                meta.extend(base_bytes)
+                meta.extend(struct.pack("!I", len(rel_bytes)))
+                meta.extend(rel_bytes)
+                meta.extend(struct.pack("!Q", file_size))
+                meta.extend(struct.pack("!I", target_id))
+
+                self._client.send_frame(MSG_FILE_META, HOST_ID, bytes(meta))
+                self._file_tab.set_status(f"[{idx}/{total}] {rel_path}")
+
+                # 数据块
+                with open(full_path, "rb") as f:
+                    while True:
+                        chunk = f.read(config.FILE_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        self._client.send_frame(MSG_FILE_CHUNK, target_id, chunk)
+                        time.sleep(config.FILE_SEND_DELAY)
+
+                time.sleep(0.01)
+
+            except OSError as e:
+                log.error(TAG, f"File send error ({rel_path}): {e}")
+                continue
+
+        self._file_tab.set_status(f"文件夹发送完成: {folder_name} ({total} 个文件)")
+        self._file_tab.update_progress(100, "完成", "")
+        log.log(TAG, f"Folder sent: {folder_name} to {target_id}")
+
+    def _on_file_complete(self, path: str) -> None:
+        self._file_tab.set_status(f"接收完成: {os.path.basename(path)}")
+
+    def _on_probe(self) -> None:
+        """房客探测房主在线状态。"""
+        if network.probe_tcp(self._peer_ip, config.TCP_PORT, timeout=2.0):
+            self._status_bar.showMessage("房主在线")
+        else:
+            self._status_bar.showMessage("房主离线")
+
+    # ═════════════════════════════════════════
+    # 窗口关闭
+    # ═════════════════════════════════════════
+
+    def closeEvent(self, event) -> None:
+        """清理所有资源。"""
+        log.log(TAG, "Shutting down...")
+
+        # 停止投屏
+        if self._screen_host:
+            self._screen_host.stop()
+        if self._screen_guest:
+            self._screen_guest.stop()
+
+        # 停止音频
+        if self._audio_mixer:
+            self._audio_mixer.stop()
+        if self._guest_audio:
+            self._guest_audio.stop()
+        self._host_mic_running = False
+        if self._host_mic_thread:
+            self._host_mic_thread.join(timeout=3)
+
+        # 停止文件传输
+        if self._host_file:
+            self._host_file.cleanup()
+
+        # 停止网络
+        if self._server:
+            self._server.stop()
+        if self._client:
+            self._client.stop()
+
+        log.log(TAG, "Shutdown complete")
+        event.accept()
