@@ -31,10 +31,22 @@ class ScreenHost:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._sct: Optional[mss.mss] = None
+        # 当前分辨率设置 (0,0)=原画
+        preset = config.SCREEN_PRESETS[config.DEFAULT_SCREEN_PRESET]
+        self._target_w: int = preset[1]
+        self._target_h: int = preset[2]
+        self._lock = threading.Lock()
 
     @property
     def running(self) -> bool:
         return self._running
+
+    def set_resolution(self, width: int, height: int) -> None:
+        """动态设置输出分辨率。(0,0) 表示原画。"""
+        with self._lock:
+            self._target_w = width
+            self._target_h = height
+        log.log(TAG, f"Resolution set to {width}x{height}" if height > 0 else "Resolution set to native")
 
     def start(self) -> None:
         if self._running:
@@ -48,18 +60,23 @@ class ScreenHost:
 
     def _capture_loop(self) -> None:
         interval = 1.0 / config.CAPTURE_FPS
+        sct = None
         try:
-            self._sct = mss.mss()
-            monitor = self._sct.monitors[1]  # 主显示器
+            sct = mss.mss()
+            monitor = sct.monitors[1]  # 主显示器
             while self._running:
                 t0 = time.perf_counter()
 
                 # 截屏
-                raw = self._sct.grab(monitor)
+                raw = sct.grab(monitor)
                 img = np.array(raw)[:, :, :3]  # BGRA -> BGR
 
                 # 缩放
-                img = cv2.resize(img, (config.TARGET_WIDTH, config.TARGET_HEIGHT))
+                with self._lock:
+                    tw, th = self._target_w, self._target_h
+                if th > 0 and tw > 0:
+                    img = cv2.resize(img, (tw, th))
+                # 原画模式不缩放
 
                 # JPEG 编码
                 _, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, config.JPEG_QUALITY])
@@ -78,6 +95,13 @@ class ScreenHost:
         except Exception as e:
             log.error(TAG, f"Screen capture error: {e}")
         finally:
+            # 在创建 sct 的线程中关闭，避免跨线程 ReleaseDC 错误
+            if sct:
+                try:
+                    sct.close()
+                except Exception:
+                    pass
+            self._sct = None
             self._running = False
             log.log(TAG, "Screen host stopped")
 
@@ -86,7 +110,4 @@ class ScreenHost:
         if self._thread:
             self._thread.join(timeout=3)
             self._thread = None
-        if self._sct:
-            self._sct.close()
-            self._sct = None
         log.log(TAG, "Screen host resources released")

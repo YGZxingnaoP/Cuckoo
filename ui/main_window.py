@@ -46,6 +46,7 @@ from func.screen_share.guest import ScreenGuest
 from func.voice_chat.mixer import AudioMixer
 from func.voice_chat.guest_audio import GuestAudio
 from func.file_transfer.host_file import HostFileHandler
+from func.file_transfer.guest_file import GuestFileReceiver
 
 TAG = "MainWindow"
 
@@ -82,6 +83,7 @@ class MainWindow(QMainWindow):
         self._audio_mixer: Optional[AudioMixer] = None
         self._guest_audio: Optional[GuestAudio] = None
         self._host_file: Optional[HostFileHandler] = None
+        self._guest_file_recv: Optional[GuestFileReceiver] = None
 
         # 主机麦克风采集线程
         self._host_mic_running = False
@@ -138,6 +140,7 @@ class MainWindow(QMainWindow):
 
         # ── 信号绑定 ──
         self._screen_tab.toggle_requested.connect(self._on_toggle_screen)
+        self._screen_tab.resolution_changed.connect(self._on_resolution_changed)
         self._voice_tab.toggle_mic_requested.connect(self._on_toggle_mic)
         self._chat_tab.send_requested.connect(self._on_chat_send)
         self._file_tab.file_send_requested.connect(self._on_file_send)
@@ -265,11 +268,18 @@ class MainWindow(QMainWindow):
         # 初始化音频（但不开启麦克风）
         self._guest_audio = GuestAudio(self._peer_ip, assigned_id)
 
+        # 初始化文件接收器
+        self._guest_file_recv = GuestFileReceiver()
+        self._guest_file_recv.progress.connect(self._file_tab.update_progress)
+        self._guest_file_recv.file_complete.connect(self._on_file_complete)
+        self._guest_file_recv.status_changed.connect(self._file_tab.set_status)
+
         self._status_bar.showMessage(f"已连接房主 — ID: {assigned_id}")
         log.log(TAG, f"Joined as ID={assigned_id}")
 
-    def _on_user_list(self, users: dict) -> None:
+    def _on_user_list(self, users_list: list) -> None:
         """收到在线用户列表。"""
+        users = dict(users_list)
         for uid, nick in users.items():
             self._nicknames.set(uid, nick)
         self._update_guest_file_targets(users)
@@ -313,7 +323,12 @@ class MainWindow(QMainWindow):
         elif msg_type == MSG_SCREEN_FRAME:
             if self._screen_guest:
                 self._screen_guest.push_frame_data(payload)
-        # MSG_FILE_META / MSG_FILE_CHUNK 暂由简单处理（未来可扩展为 GuestFileReceiver）
+        elif msg_type == MSG_FILE_META:
+            if self._guest_file_recv:
+                self._guest_file_recv.handle_file_meta(sender_id, payload)
+        elif msg_type == MSG_FILE_CHUNK:
+            if self._guest_file_recv:
+                self._guest_file_recv.handle_file_chunk(sender_id, payload)
 
     def _handle_text_guest(self, sender_id: int, payload: bytes) -> None:
         """房客处理文本消息。"""
@@ -368,6 +383,11 @@ class MainWindow(QMainWindow):
                 log.log(TAG, "Screen sharing started")
             else:
                 QMessageBox.warning(self, "提示", "服务器尚未就绪。")
+
+    def _on_resolution_changed(self, width: int, height: int) -> None:
+        """投屏分辨率变更。"""
+        if self._screen_host:
+            self._screen_host.set_resolution(width, height)
 
     def _on_toggle_mic(self) -> None:
         """麦克风开关。"""
@@ -496,7 +516,7 @@ class MainWindow(QMainWindow):
             meta.extend(struct.pack("!Q", file_size))
             meta.extend(struct.pack("!I", target_id))
 
-            self._client.send_frame(MSG_FILE_META, HOST_ID, bytes(meta))
+            self._client.send_frame(MSG_FILE_META, BROADCAST_ID, bytes(meta))
 
             display = f"{base_name}/{filename}" if base_name else filename
             self._file_tab.set_status(f"正在发送: {display}")
@@ -508,7 +528,7 @@ class MainWindow(QMainWindow):
                     chunk = f.read(config.FILE_CHUNK_SIZE)
                     if not chunk:
                         break
-                    self._client.send_frame(MSG_FILE_CHUNK, target_id, chunk)
+                    self._client.send_frame(MSG_FILE_CHUNK, BROADCAST_ID, chunk)
                     time.sleep(config.FILE_SEND_DELAY)
 
             self._file_tab.set_status(f"发送完成: {display}")
@@ -549,7 +569,7 @@ class MainWindow(QMainWindow):
                 meta.extend(struct.pack("!Q", file_size))
                 meta.extend(struct.pack("!I", target_id))
 
-                self._client.send_frame(MSG_FILE_META, HOST_ID, bytes(meta))
+                self._client.send_frame(MSG_FILE_META, BROADCAST_ID, bytes(meta))
                 self._file_tab.set_status(f"[{idx}/{total}] {rel_path}")
 
                 # 数据块
@@ -558,7 +578,7 @@ class MainWindow(QMainWindow):
                         chunk = f.read(config.FILE_CHUNK_SIZE)
                         if not chunk:
                             break
-                        self._client.send_frame(MSG_FILE_CHUNK, target_id, chunk)
+                        self._client.send_frame(MSG_FILE_CHUNK, BROADCAST_ID, chunk)
                         time.sleep(config.FILE_SEND_DELAY)
 
                 time.sleep(0.01)
@@ -607,6 +627,8 @@ class MainWindow(QMainWindow):
         # 停止文件传输
         if self._host_file:
             self._host_file.cleanup()
+        if self._guest_file_recv:
+            self._guest_file_recv.cleanup()
 
         # 停止网络
         if self._server:

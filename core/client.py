@@ -41,7 +41,7 @@ class ClientConnection(QObject):
 
     frame_received = Signal(int, int, int, bytes)
     joined = Signal(int, str)
-    user_list = Signal(dict)
+    user_list = Signal(list)
     user_joined = Signal(int, str)
     user_left = Signal(int, str)
     disconnected = Signal()
@@ -199,7 +199,7 @@ class ClientConnection(QObject):
             offset += nick_len
             users[uid] = nick
         log.log(TAG, f"User list: {users}")
-        self.user_list.emit(users)
+        self.user_list.emit(list(users.items()))
 
     # ═════════════════════════════════════════
     # 发送 API
