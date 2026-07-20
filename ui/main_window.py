@@ -141,6 +141,7 @@ class MainWindow(QMainWindow):
         # ── 信号绑定 ──
         self._screen_tab.toggle_requested.connect(self._on_toggle_screen)
         self._screen_tab.resolution_changed.connect(self._on_resolution_changed)
+        self._screen_tab.fps_changed.connect(self._on_fps_changed)
         self._voice_tab.toggle_mic_requested.connect(self._on_toggle_mic)
         self._chat_tab.send_requested.connect(self._on_chat_send)
         self._file_tab.file_send_requested.connect(self._on_file_send)
@@ -388,6 +389,11 @@ class MainWindow(QMainWindow):
         """投屏分辨率变更。"""
         if self._screen_host:
             self._screen_host.set_resolution(width, height)
+
+    def _on_fps_changed(self, fps: int) -> None:
+        """投屏帧率变更。"""
+        if self._screen_host:
+            self._screen_host.set_fps(fps)
 
     def _on_toggle_mic(self) -> None:
         """麦克风开关。"""

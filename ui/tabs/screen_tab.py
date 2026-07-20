@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 投屏 Tab 页面
-主机显示控制按钮和分辨率选择，房客显示接收画面。
+主机显示控制按钮、分辨率选择和帧率选择，房客显示接收画面。
 """
 
 from PySide6.QtWidgets import (
@@ -16,13 +16,15 @@ import config
 
 class ScreenTab(QWidget):
     """
-    投屏界面：视频显示区域 + 开始/停止按钮 + 分辨率选择（仅房主可见）。
+    投屏界面：视频显示区域 + 开始/停止按钮 + 分辨率/帧率选择（仅房主可见）。
     """
 
     # 房主投屏切换信号
     toggle_requested = Signal()
     # 分辨率变更信号: (width, height)  — (0,0) 表示原画
     resolution_changed = Signal(int, int)
+    # 帧率变更信号: fps
+    fps_changed = Signal(int)
 
     def __init__(self, is_host: bool, parent=None):
         super().__init__(parent)
@@ -56,6 +58,16 @@ class ScreenTab(QWidget):
             self._res_combo.currentIndexChanged.connect(self._on_res_changed)
             ctrl_layout.addWidget(self._res_combo)
 
+            # 帧率选择
+            ctrl_layout.addWidget(QLabel("帧率："))
+            self._fps_combo = QComboBox()
+            self._fps_combo.setObjectName("fpsCombo")
+            for name, fps in config.FPS_PRESETS:
+                self._fps_combo.addItem(name, fps)
+            self._fps_combo.setCurrentIndex(config.DEFAULT_FPS_PRESET)
+            self._fps_combo.currentIndexChanged.connect(self._on_fps_changed)
+            ctrl_layout.addWidget(self._fps_combo)
+
             # 投屏开关按钮
             self._btn_toggle = QPushButton("开始投屏")
             self._btn_toggle.setObjectName("btnToggleScreen")
@@ -72,6 +84,11 @@ class ScreenTab(QWidget):
         if data:
             w, h = data
             self.resolution_changed.emit(w, h)
+
+    def _on_fps_changed(self, index: int) -> None:
+        fps = self._fps_combo.itemData(index)
+        if fps:
+            self.fps_changed.emit(fps)
 
     def start_streaming(self) -> None:
         """更新按钮状态为"正在投屏"。"""

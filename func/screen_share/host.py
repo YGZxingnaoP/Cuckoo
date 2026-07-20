@@ -31,10 +31,12 @@ class ScreenHost:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._sct: Optional[mss.mss] = None
-        # 当前分辨率设置 (0,0)=原画
+        # 当前分辨率和帧率设置
         preset = config.SCREEN_PRESETS[config.DEFAULT_SCREEN_PRESET]
         self._target_w: int = preset[1]
         self._target_h: int = preset[2]
+        fps_preset = config.FPS_PRESETS[config.DEFAULT_FPS_PRESET]
+        self._fps: int = fps_preset[1]
         self._lock = threading.Lock()
 
     @property
@@ -48,6 +50,12 @@ class ScreenHost:
             self._target_h = height
         log.log(TAG, f"Resolution set to {width}x{height}" if height > 0 else "Resolution set to native")
 
+    def set_fps(self, fps: int) -> None:
+        """动态设置采集帧率。"""
+        with self._lock:
+            self._fps = fps
+        log.log(TAG, f"FPS set to {fps}")
+
     def start(self) -> None:
         if self._running:
             return
@@ -59,7 +67,6 @@ class ScreenHost:
         log.log(TAG, "Screen host started (broadcasting)")
 
     def _capture_loop(self) -> None:
-        interval = 1.0 / config.CAPTURE_FPS
         sct = None
         try:
             sct = mss.mss()
@@ -67,13 +74,17 @@ class ScreenHost:
             while self._running:
                 t0 = time.perf_counter()
 
+                # 读取当前设置
+                with self._lock:
+                    tw, th = self._target_w, self._target_h
+                    fps = self._fps
+                interval = 1.0 / fps if fps > 0 else 1.0 / 15
+
                 # 截屏
                 raw = sct.grab(monitor)
                 img = np.array(raw)[:, :, :3]  # BGRA -> BGR
 
                 # 缩放
-                with self._lock:
-                    tw, th = self._target_w, self._target_h
                 if th > 0 and tw > 0:
                     img = cv2.resize(img, (tw, th))
                 # 原画模式不缩放

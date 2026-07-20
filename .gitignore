@@ -25,3 +25,6 @@ Desktop.ini
 # Temp files
 *.part
 *.tmp
+
+# Received files directory
+downloads/

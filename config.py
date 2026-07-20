@@ -5,6 +5,8 @@ Cuckoo 私有实时通信平台 —— 全局配置常量
 严禁擅自修改端口号或核心参数。
 """
 
+import os as _os
+
 # ─────────────────────────────────────────────
 # 网络端口（星型拓扑：统一入口 + 语音 UDP）
 # ─────────────────────────────────────────────
@@ -14,7 +16,7 @@ UDP_VOICE_PORT: int = 5001    # 语音 UDP 通道
 # ─────────────────────────────────────────────
 # 投屏参数
 # ─────────────────────────────────────────────
-CAPTURE_FPS: int = 15         # 降低帧率以节省带宽（1对N分发）
+CAPTURE_FPS: int = 15         # 默认帧率（可动态切换）
 TARGET_WIDTH: int = 1280
 TARGET_HEIGHT: int = 720
 JPEG_QUALITY: int = 70        # 1-100
@@ -26,6 +28,15 @@ SCREEN_PRESETS: list = [
     ("原画质", 0, 0),
 ]
 DEFAULT_SCREEN_PRESET: int = 0  # 默认使用第一个预设(720p)
+
+# 帧率预设: (名称, fps)
+FPS_PRESETS: list = [
+    ("15 FPS", 15),
+    ("30 FPS", 30),
+    ("60 FPS", 60),
+    ("120 FPS", 120),
+]
+DEFAULT_FPS_PRESET: int = 0  # 默认15fps
 
 # ─────────────────────────────────────────────
 # 语音参数
@@ -58,3 +69,8 @@ RECONNECT_MAX_RETRY: int = 3
 # ─────────────────────────────────────────────
 WINDOW_WIDTH: int = 1024
 WINDOW_HEIGHT: int = 768
+
+# ─────────────────────────────────────────────
+# 文件接收保存目录（项目内 downloads 文件夹）
+# ─────────────────────────────────────────────
+DOWNLOAD_DIR: str = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "downloads")

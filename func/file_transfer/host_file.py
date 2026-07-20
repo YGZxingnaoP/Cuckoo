@@ -54,7 +54,8 @@ class HostFileHandler(QObject):
     def __init__(self, server: Server, save_dir: str = ""):
         super().__init__()
         self._server = server
-        self._save_dir = save_dir or os.path.expanduser("~/Downloads")
+        self._save_dir = save_dir or config.DOWNLOAD_DIR
+        os.makedirs(self._save_dir, exist_ok=True)
         self._transfers: dict[int, IncomingTransfer] = {}  # sender_id -> transfer
 
         # 注册消息处理器
