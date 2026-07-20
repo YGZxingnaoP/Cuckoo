@@ -61,6 +61,12 @@ class MainWindow(QMainWindow):
     4. 管理生命周期
     """
 
+    # 线程安全 UI 更新信号（供后台线程 emit → 主线程 slot）
+    _send_status = Signal(str)
+    _send_progress = Signal(int, str, str)
+    _client_event = Signal(str)  # 房客加入/离开事件文本
+    _targets_changed = Signal(list)  # 房客加入/离开时更新目标列表
+
     def __init__(self, is_host: bool, peer_ip: str = "", nickname: str = ""):
         super().__init__()
         self._is_host = is_host
@@ -147,6 +153,12 @@ class MainWindow(QMainWindow):
         self._file_tab.file_send_requested.connect(self._on_file_send)
         self._file_tab.folder_send_requested.connect(self._on_folder_send)
 
+        # 线程安全 UI 更新信号连接
+        self._send_status.connect(self._file_tab.set_status)
+        self._send_progress.connect(self._file_tab.update_progress)
+        self._client_event.connect(self._on_client_event_ui)
+        self._targets_changed.connect(self._on_targets_changed_ui)
+
     # ═════════════════════════════════════════
     # 服务启动
     # ═════════════════════════════════════════
@@ -202,28 +214,30 @@ class MainWindow(QMainWindow):
             sys.exit(1)
 
     def _on_client_joined(self, uid: int, nickname: str) -> None:
-        """房客加入回调（从 Server 线程调用）。"""
+        """房客加入回调（从 Server 线程调用）→ 通过信号安全更新 UI。"""
         self._nicknames.set(uid, nickname)
-        self._chat_tab.append_system(f"{nickname} 加入了房间")
-        self._update_file_targets()
-        self._status_bar.showMessage(f"{nickname} 加入 — 当前 {len(self._server.clients)} 人在线")
+        targets = {u: info.nickname or f"房客{u}" for u, info in self._server.clients.items()}
+        self._targets_changed.emit(list(targets.items()))
+        self._client_event.emit(f"{nickname} 加入了房间")
 
     def _on_client_left(self, uid: int, nickname: str) -> None:
         """房客离开回调。"""
         self._nicknames.remove(uid)
         if self._audio_mixer:
             self._audio_mixer.unregister_client(uid)
-        self._chat_tab.append_system(f"{nickname} 离开了房间")
-        self._update_file_targets()
-        if self._server:
-            self._status_bar.showMessage(f"{nickname} 离开 — 当前 {len(self._server.clients)} 人在线")
+        targets = {u: info.nickname or f"房客{u}" for u, info in self._server.clients.items()} if self._server else {}
+        self._targets_changed.emit(list(targets.items()))
+        self._client_event.emit(f"{nickname} 离开了房间")
 
-    def _update_file_targets(self) -> None:
-        """更新文件发送目标列表。"""
-        targets = {}
-        for uid, info in self._server.clients.items():
-            targets[uid] = info.nickname or f"房客{uid}"
-        self._file_tab.update_targets(targets)
+    def _on_client_event_ui(self, text: str) -> None:
+        """主线程槽：处理房客加入/离开事件的 UI 更新。"""
+        self._chat_tab.append_system(text)
+        if self._server:
+            self._status_bar.showMessage(f"{text} — 当前 {len(self._server.clients)} 人在线")
+
+    def _on_targets_changed_ui(self, targets_list: list) -> None:
+        """主线程槽：更新文件发送目标列表。"""
+        self._file_tab.update_targets(dict(targets_list))
 
     # ─────────────────────────────────────────
     # 房客服务
@@ -409,6 +423,9 @@ class MainWindow(QMainWindow):
             self._voice_tab.set_mic_off()
             if self._host_mic_thread:
                 self._host_mic_thread.join(timeout=3)
+            # 停止回放
+            if self._audio_mixer:
+                self._audio_mixer.stop_playback()
             log.log(TAG, "Host mic off")
         else:
             if not self._audio_mixer:
@@ -416,6 +433,8 @@ class MainWindow(QMainWindow):
                 return
             self._host_mic_running = True
             self._voice_tab.set_mic_on()
+            # 启动回放（房主听混合音频）
+            self._audio_mixer.start_playback()
             self._host_mic_thread = threading.Thread(
                 target=self._host_mic_loop, daemon=True, name="HostMic"
             )
@@ -525,7 +544,7 @@ class MainWindow(QMainWindow):
             self._client.send_frame(MSG_FILE_META, BROADCAST_ID, bytes(meta))
 
             display = f"{base_name}/{filename}" if base_name else filename
-            self._file_tab.set_status(f"正在发送: {display}")
+            self._send_status.emit(f"正在发送: {display}")
 
             # 数据块
             import time
@@ -537,13 +556,13 @@ class MainWindow(QMainWindow):
                     self._client.send_frame(MSG_FILE_CHUNK, BROADCAST_ID, chunk)
                     time.sleep(config.FILE_SEND_DELAY)
 
-            self._file_tab.set_status(f"发送完成: {display}")
-            self._file_tab.update_progress(100, "完成", "")
+            self._send_status.emit(f"发送完成: {display}")
+            self._send_progress.emit(100, "完成", "")
             log.log(TAG, f"File sent: {display} to {target_id}")
 
         except OSError as e:
             log.error(TAG, f"File send error: {e}")
-            self._file_tab.set_status(f"发送失败: {e}")
+            self._send_status.emit(f"发送失败: {e}")
 
     def _guest_folder_loop(self, folder_path: str, target_id: int) -> None:
         """房客文件夹发送循环（遍历文件夹逐个发送）。"""
@@ -556,7 +575,7 @@ class MainWindow(QMainWindow):
                 file_list.append((full_path, rel_path))
 
         total = len(file_list)
-        self._file_tab.set_status(f"正在发送文件夹: {folder_name} ({total} 个文件)")
+        self._send_status.emit(f"正在发送文件夹: {folder_name} ({total} 个文件)")
         log.log(TAG, f"Sending folder '{folder_name}' with {total} files to {target_id}")
 
         import time
@@ -576,7 +595,7 @@ class MainWindow(QMainWindow):
                 meta.extend(struct.pack("!I", target_id))
 
                 self._client.send_frame(MSG_FILE_META, BROADCAST_ID, bytes(meta))
-                self._file_tab.set_status(f"[{idx}/{total}] {rel_path}")
+                self._send_status.emit(f"[{idx}/{total}] {rel_path}")
 
                 # 数据块
                 with open(full_path, "rb") as f:
@@ -593,8 +612,8 @@ class MainWindow(QMainWindow):
                 log.error(TAG, f"File send error ({rel_path}): {e}")
                 continue
 
-        self._file_tab.set_status(f"文件夹发送完成: {folder_name} ({total} 个文件)")
-        self._file_tab.update_progress(100, "完成", "")
+        self._send_status.emit(f"文件夹发送完成: {folder_name} ({total} 个文件)")
+        self._send_progress.emit(100, "完成", "")
         log.log(TAG, f"Folder sent: {folder_name} to {target_id}")
 
     def _on_file_complete(self, path: str) -> None:

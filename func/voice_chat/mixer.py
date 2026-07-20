@@ -14,6 +14,7 @@ from collections import defaultdict
 from typing import Optional
 
 import numpy as np
+import pyaudio
 
 from common import logger as log
 from core.protocol import build_voice_packet, parse_voice_packet, HOST_ID
@@ -52,6 +53,13 @@ class AudioMixer:
         # 客户端 UDP 地址表：{client_id: (ip, port)}
         self._client_addrs: dict[int, tuple] = {}
         self._addr_lock = threading.Lock()
+
+        # 主机回放（扬声器播放混合音频）
+        self._playback_buffer: list[bytes] = []
+        self._playback_lock = threading.Lock()
+        self._playback_thread: Optional[threading.Thread] = None
+        self._playback_pa: Optional[pyaudio.PyAudio] = None
+        self._playback_stream: Optional[pyaudio.Stream] = None
 
     # ═════════════════════════════════════════
     # 客户端地址管理
@@ -101,6 +109,9 @@ class AudioMixer:
     def stop(self) -> None:
         """停止混音器。"""
         self._running = False
+
+        # 停止回放
+        self.stop_playback()
 
         if self._sock:
             try:
@@ -180,8 +191,14 @@ class AudioMixer:
             # 混合
             mixed = self._mix_pcm(all_pcm)
 
-            # 广播
+            # 广播给客户端
             self._broadcast_mixed(mixed)
+
+            # 写入主机回放缓冲
+            with self._playback_lock:
+                self._playback_buffer.append(mixed)
+                if len(self._playback_buffer) > 10:
+                    self._playback_buffer = self._playback_buffer[-5:]
 
         log.log(TAG, "Mix loop stopped")
 
@@ -218,3 +235,71 @@ class AudioMixer:
                 self._sock.sendto(pkt, addr)
             except OSError as e:
                 log.error(TAG, f"Send to {uid} error: {e}")
+
+    # ═════════════════════════════════════════
+    # 主机音频回放
+    # ═════════════════════════════════════════
+
+    def start_playback(self) -> bool:
+        """启动主机音频回放（播放混合音频到扬声器）。"""
+        if self._playback_thread and self._playback_thread.is_alive():
+            return True
+        try:
+            self._playback_pa = pyaudio.PyAudio()
+            self._playback_stream = self._playback_pa.open(
+                format=pyaudio.paInt16,
+                channels=config.AUDIO_CHANNELS,
+                rate=config.AUDIO_RATE,
+                output=True,
+                frames_per_buffer=config.AUDIO_CHUNK
+            )
+            self._playback_thread = threading.Thread(
+                target=self._playback_loop, daemon=True, name="HostPlayback"
+            )
+            self._playback_thread.start()
+            log.log(TAG, "Host playback started")
+            return True
+        except Exception as e:
+            log.error(TAG, f"Playback init error: {e}")
+            self.stop_playback()
+            return False
+
+    def stop_playback(self) -> None:
+        """停止主机音频回放。"""
+        if self._playback_stream:
+            try:
+                self._playback_stream.stop_stream()
+                self._playback_stream.close()
+            except Exception:
+                pass
+            self._playback_stream = None
+        if self._playback_pa:
+            self._playback_pa.terminate()
+            self._playback_pa = None
+        if self._playback_thread:
+            self._playback_thread.join(timeout=2)
+            self._playback_thread = None
+        with self._playback_lock:
+            self._playback_buffer.clear()
+        log.log(TAG, "Host playback stopped")
+
+    def _playback_loop(self) -> None:
+        """主机回放线程：从缓冲区播放混合音频到扬声器。"""
+        log.log(TAG, "Playback loop started")
+        while self._running:
+            chunk = None
+            with self._playback_lock:
+                if self._playback_buffer:
+                    chunk = self._playback_buffer.pop(0)
+            if chunk is None:
+                import time
+                time.sleep(0.005)
+                continue
+            try:
+                if self._playback_stream:
+                    self._playback_stream.write(chunk)
+            except Exception as e:
+                if self._running:
+                    log.error(TAG, f"Playback write error: {e}")
+                break
+        log.log(TAG, "Playback loop stopped")

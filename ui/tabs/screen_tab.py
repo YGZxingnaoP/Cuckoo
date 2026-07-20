@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QPushButton, QComboBox
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPixmap, QImage
 
 import config
 
@@ -104,8 +104,9 @@ class ScreenTab(QWidget):
         if self._is_host:
             self._btn_toggle.setText("开始投屏")
 
-    def update_frame(self, pixmap: QPixmap) -> None:
-        """接收端解码线程通过信号传入 QPixmap。"""
+    def update_frame(self, image: QImage) -> None:
+        """接收端解码线程通过信号传入 QImage，在主线程转换为 QPixmap。"""
+        pixmap = QPixmap.fromImage(image)
         self._video_label.setPixmap(
             pixmap.scaled(
                 self._video_label.size(),

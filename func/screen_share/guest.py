@@ -9,7 +9,7 @@ import threading
 from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QImage
 
 from common import logger as log
 
@@ -21,10 +21,10 @@ class ScreenGuest(QObject):
     房客投屏接收器。
     由 ClientConnection 的 frame_received 信号驱动，在独立线程中解码。
     信号：
-      - frame_ready(QPixmap): 解码完成的画面
+      - frame_ready(QImage): 解码完成的画面（在后台线程创建 QImage，主线程转 QPixmap）
     """
 
-    frame_ready = Signal(QPixmap)
+    frame_ready = Signal(QImage)
 
     def __init__(self):
         super().__init__()
@@ -63,10 +63,10 @@ class ScreenGuest(QObject):
                 threading.Event().wait(0.005)
                 continue
 
-            # 解码 JPEG -> QPixmap
-            pixmap = QPixmap()
-            if pixmap.loadFromData(frame_data, "JPG"):
-                self.frame_ready.emit(pixmap)
+            # 解码 JPEG -> QImage（QImage 可在非 GUI 线程中创建）
+            image = QImage()
+            if image.loadFromData(frame_data, "JPG"):
+                self.frame_ready.emit(image)
 
         log.log(TAG, "Screen guest decoder stopped")
 

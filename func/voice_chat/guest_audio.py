@@ -33,8 +33,8 @@ class GuestAudio:
         self._pa: Optional[pyaudio.PyAudio] = None
         self._input_stream: Optional[pyaudio.Stream] = None
         self._output_stream: Optional[pyaudio.Stream] = None
-        self._send_sock: Optional[socket.socket] = None
-        self._recv_sock: Optional[socket.socket] = None
+        # 单一 UDP socket：双向通信（发送麦克风 + 接收混合音频）
+        self._sock: Optional[socket.socket] = None
         self._send_thread: Optional[threading.Thread] = None
         self._recv_thread: Optional[threading.Thread] = None
         self._seq = 0
@@ -76,17 +76,17 @@ class GuestAudio:
                 frames_per_buffer=config.AUDIO_CHUNK
             )
 
-            # UDP 发送 socket
-            self._send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-            # UDP 接收 socket
-            self._recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self._recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._recv_sock.bind(("0.0.0.0", config.UDP_VOICE_PORT))
-            self._recv_sock.settimeout(1.0)
+            # 单一 UDP socket（双向：发送麦克风 + 接收混合音频）
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.bind(("0.0.0.0", 0))
+            self._sock.settimeout(1.0)
+            log.log(TAG, f"UDP socket bound to port {self._sock.getsockname()[1]}")
 
             self._running = True
             self._mic_on = True
+
+            # 立即发送一个“注册包”让主机 mixer 发现此 socket 的地址
+            self._send_hello()
 
             # 启动发送线程
             self._send_thread = threading.Thread(
@@ -113,19 +113,12 @@ class GuestAudio:
         self._running = False
         self._mic_on = False
 
-        if self._send_sock:
+        if self._sock:
             try:
-                self._send_sock.close()
+                self._sock.close()
             except OSError:
                 pass
-            self._send_sock = None
-
-        if self._recv_sock:
-            try:
-                self._recv_sock.close()
-            except OSError:
-                pass
-            self._recv_sock = None
+            self._sock = None
 
         if self._input_stream:
             try:
@@ -160,17 +153,24 @@ class GuestAudio:
 
     def _send_loop(self) -> None:
         log.log(TAG, "Send loop started")
+        silent_count = 0
         while self._running:
             try:
                 pcm_data = self._input_stream.read(
                     config.AUDIO_CHUNK, exception_on_overflow=False
                 )
-                # 简单 VAD：静音时不发送
-                if self._is_silent(pcm_data):
-                    continue
+                # VAD：静音时每 5 帧发送一次保活，有声音时始终发送
+                is_silent = self._is_silent(pcm_data)
+                if is_silent:
+                    silent_count += 1
+                    if silent_count < 5:
+                        continue
+                    silent_count = 0
+                else:
+                    silent_count = 0
                 pkt = build_voice_packet(self._client_id, self._seq, pcm_data)
                 self._seq = (self._seq + 1) & 0xFFFF
-                self._send_sock.sendto(pkt, (self._host_ip, config.UDP_VOICE_PORT))
+                self._sock.sendto(pkt, (self._host_ip, config.UDP_VOICE_PORT))
             except OSError as e:
                 if self._running:
                     log.error(TAG, f"Audio send error: {e}")
@@ -185,7 +185,7 @@ class GuestAudio:
         log.log(TAG, "Recv loop started")
         while self._running:
             try:
-                data, addr = self._recv_sock.recvfrom(65535)
+                data, addr = self._sock.recvfrom(65535)
                 result = parse_voice_packet(data)
                 if result is None:
                     continue
@@ -203,8 +203,19 @@ class GuestAudio:
     # 工具方法
     # ═════════════════════════════════════════
 
+    def _send_hello(self) -> None:
+        """发送一个静音包，让主机 mixer 立即发现此 socket 的 UDP 地址。"""
+        try:
+            silent_pcm = b"\x00" * (config.AUDIO_CHUNK * 2)  # 2 bytes per sample
+            pkt = build_voice_packet(self._client_id, self._seq, silent_pcm)
+            self._seq = (self._seq + 1) & 0xFFFF
+            self._sock.sendto(pkt, (self._host_ip, config.UDP_VOICE_PORT))
+            log.log(TAG, f"Hello packet sent from port {self._sock.getsockname()[1]}")
+        except OSError as e:
+            log.error(TAG, f"Hello send error: {e}")
+
     @staticmethod
-    def _is_silent(pcm_data: bytes, threshold: int = 500) -> bool:
+    def _is_silent(pcm_data: bytes, threshold: int = 100) -> bool:
         """简单 VAD：判断音频是否静音。"""
         import numpy as np
         samples = np.frombuffer(pcm_data, dtype=np.int16)
