@@ -1,48 +1,46 @@
 # -*- coding: utf-8 -*-
 """
-语音模块 —— 主机 MCU 混音器
+语音模块 —— 主机 MCU 混音器（TCP 传输）
 职责：
-  1. 接收所有房客 + 主机自身的 UDP 音频
+  1. 接收所有房客（TCP 推送）+ 主机自身的音频
   2. 按时间片混合多路 PCM（相加 + 截断）
-  3. 将混合后的音频 UDP 广播给所有房客
+  3. 将混合后的音频通过 TCP 发送给所有房客
 """
 
-import socket
 import threading
 import time
 from collections import defaultdict
-from typing import Optional
+from typing import Optional, Callable
 
 import numpy as np
 import pyaudio
 
 from common import logger as log
-from core.protocol import build_voice_packet, parse_voice_packet, HOST_ID
-from core.server import Server
 import config
 
 TAG = "AudioMixer"
 
-# 混音时间片（秒）
-MIX_INTERVAL = 0.02  # 20ms
+# 混音时间片（秒）—— 匹配 AUDIO_CHUNK / AUDIO_RATE = 64ms
+MIX_INTERVAL = 0.06  # 60ms（略小于 64ms，留处理余量）
 
 
 class AudioMixer:
     """
     主机端集中混音器（MCU）。
-    - 接收所有 UDP 语音包
+    - 接收所有音频（由 main_window 通过 push_client_audio 推送）
     - 每 20ms 混合所有音源
-    - 广播混合音频给所有房客
+    - 通过 send_callback 将混合音频发给房客
     """
 
-    def __init__(self, server: Server):
-        self._server = server
+    def __init__(self, send_callback: Optional[Callable[[int, bytes], None]] = None):
+        """
+        :param send_callback: fn(client_uid, pcm_data) 用于向房客发送混合音频
+        """
         self._running = False
-        self._sock: Optional[socket.socket] = None
-        self._recv_thread: Optional[threading.Thread] = None
         self._mix_thread: Optional[threading.Thread] = None
+        self._send_callback: Optional[Callable[[int, bytes], None]] = send_callback
 
-        # 多路音频缓冲：{sender_id: [pcm_chunk, pcm_chunk, ...]}
+        # 多路音频缓冲：{sender_id: [pcm_chunk, ...]}
         self._buffers: dict[int, list[bytes]] = defaultdict(list)
         self._buffer_lock = threading.Lock()
 
@@ -50,9 +48,9 @@ class AudioMixer:
         self._host_buffer: list[bytes] = []
         self._host_lock = threading.Lock()
 
-        # 客户端 UDP 地址表：{client_id: (ip, port)}
-        self._client_addrs: dict[int, tuple] = {}
-        self._addr_lock = threading.Lock()
+        # 已连接的客户端 ID 集合
+        self._client_ids: set[int] = set()
+        self._client_lock = threading.Lock()
 
         # 主机回放（扬声器播放混合音频）
         self._playback_buffer: list[bytes] = []
@@ -62,22 +60,26 @@ class AudioMixer:
         self._playback_stream: Optional[pyaudio.Stream] = None
 
     # ═════════════════════════════════════════
-    # 客户端地址管理
+    # 客户端管理
     # ═════════════════════════════════════════
 
-    def register_client(self, uid: int, addr: tuple) -> None:
-        """注册客户端的 UDP 地址。"""
-        with self._addr_lock:
-            self._client_addrs[uid] = addr
-        log.log(TAG, f"Registered client {uid} at {addr}")
+    def register_client(self, uid: int) -> None:
+        """注册客户端。"""
+        with self._client_lock:
+            self._client_ids.add(uid)
+        log.log(TAG, f"Registered client {uid}")
 
     def unregister_client(self, uid: int) -> None:
         """移除客户端。"""
-        with self._addr_lock:
-            self._client_addrs.pop(uid, None)
+        with self._client_lock:
+            self._client_ids.discard(uid)
         with self._buffer_lock:
             self._buffers.pop(uid, None)
         log.log(TAG, f"Unregistered client {uid}")
+
+    def set_send_callback(self, cb: Callable[[int, bytes], None]) -> None:
+        """设置发送回调。"""
+        self._send_callback = cb
 
     # ═════════════════════════════════════════
     # 启动与停止
@@ -88,23 +90,14 @@ class AudioMixer:
         if self._running:
             return
 
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(("0.0.0.0", config.UDP_VOICE_PORT))
-        self._sock.settimeout(0.5)
         self._running = True
-
-        self._recv_thread = threading.Thread(
-            target=self._recv_loop, daemon=True, name="AudioMixerRecv"
-        )
-        self._recv_thread.start()
 
         self._mix_thread = threading.Thread(
             target=self._mix_loop, daemon=True, name="AudioMixerMix"
         )
         self._mix_thread.start()
 
-        log.log(TAG, f"Audio mixer started on UDP port {config.UDP_VOICE_PORT}")
+        log.log(TAG, "Audio mixer started (TCP mode)")
 
     def stop(self) -> None:
         """停止混音器。"""
@@ -113,94 +106,28 @@ class AudioMixer:
         # 停止回放
         self.stop_playback()
 
-        if self._sock:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
-            self._sock = None
-
-        if self._recv_thread:
-            self._recv_thread.join(timeout=2)
         if self._mix_thread:
             self._mix_thread.join(timeout=2)
 
         log.log(TAG, "Audio mixer stopped")
 
     # ═════════════════════════════════════════
-    # 接收循环
+    # 音频输入（由 main_window 调用）
     # ═════════════════════════════════════════
 
-    def _recv_loop(self) -> None:
-        """UDP 接收线程：解析语音包，存入缓冲区。"""
-        log.log(TAG, "UDP recv loop started")
-        while self._running:
-            try:
-                data, addr = self._sock.recvfrom(65535)
-                result = parse_voice_packet(data)
-                if result is None:
-                    continue
-                sender_id, seq, pcm_data = result
+    def push_client_audio(self, sender_id: int, pcm_data: bytes) -> None:
+        """接收来自房客的音频（由 Server handler 调用）。"""
+        # 自动注册
+        with self._client_lock:
+            if sender_id not in self._client_ids:
+                self._client_ids.add(sender_id)
+                log.log(TAG, f"Auto-registered client {sender_id} from voice data")
 
-                # 自动注册客户端地址
-                with self._addr_lock:
-                    if sender_id not in self._client_addrs:
-                        self._client_addrs[sender_id] = addr
-
-                # 存入缓冲
-                with self._buffer_lock:
-                    buf = self._buffers[sender_id]
-                    buf.append(pcm_data)
-                    # 限制缓冲深度（最多保留 5 个块）
-                    if len(buf) > 5:
-                        self._buffers[sender_id] = buf[-3:]
-
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self._running:
-                    log.error(TAG, f"UDP recv error: {e}")
-        log.log(TAG, "UDP recv loop stopped")
-
-    # ═════════════════════════════════════════
-    # 混音循环
-    # ═════════════════════════════════════════
-
-    def _mix_loop(self) -> None:
-        """混音线程：每 20ms 混合所有音源并广播。"""
-        log.log(TAG, "Mix loop started")
-        while self._running:
-            time.sleep(MIX_INTERVAL)
-
-            # 取出所有缓冲
-            with self._buffer_lock:
-                all_pcm: list[bytes] = []
-                for uid in list(self._buffers.keys()):
-                    buf = self._buffers[uid]
-                    if buf:
-                        all_pcm.append(buf.pop(0))
-
-            # 加入主机自身音频
-            with self._host_lock:
-                if self._host_buffer:
-                    all_pcm.append(self._host_buffer.pop(0))
-
-            if not all_pcm:
-                continue
-
-            # 混合
-            mixed = self._mix_pcm(all_pcm)
-
-            # 广播给客户端
-            self._broadcast_mixed(mixed)
-
-            # 写入主机回放缓冲
-            with self._playback_lock:
-                self._playback_buffer.append(mixed)
-                if len(self._playback_buffer) > 10:
-                    self._playback_buffer = self._playback_buffer[-5:]
-
-        log.log(TAG, "Mix loop stopped")
+        with self._buffer_lock:
+            buf = self._buffers[sender_id]
+            buf.append(pcm_data)
+            if len(buf) > 5:
+                self._buffers[sender_id] = buf[-3:]
 
     def push_host_audio(self, pcm_data: bytes) -> None:
         """主机麦克风采集数据入缓冲。"""
@@ -208,6 +135,68 @@ class AudioMixer:
             self._host_buffer.append(pcm_data)
             if len(self._host_buffer) > 5:
                 self._host_buffer = self._host_buffer[-3:]
+
+    # ═════════════════════════════════════════
+    # 混音循环
+    # ═════════════════════════════════════════
+
+    def _mix_loop(self) -> None:
+        """混音线程：每 60ms 混合所有音源并发送（排除各客户端自身音频）。"""
+        log.log(TAG, "Mix loop started")
+        count = 0
+        while self._running:
+            time.sleep(MIX_INTERVAL)
+
+            # 取出所有缓冲，记录来源 ID
+            client_audio: dict[int, bytes] = {}  # {client_uid: pcm}
+            host_audio: Optional[bytes] = None
+
+            with self._buffer_lock:
+                for uid in list(self._buffers.keys()):
+                    buf = self._buffers[uid]
+                    if buf:
+                        client_audio[uid] = buf.pop(0)
+
+            with self._host_lock:
+                if self._host_buffer:
+                    host_audio = self._host_buffer.pop(0)
+
+            if not client_audio and host_audio is None:
+                continue
+
+            # 为每个客户端生成排除自身音频的混合
+            if self._send_callback:
+                with self._client_lock:
+                    client_ids = list(self._client_ids)
+                for uid in client_ids:
+                    others = [pcm for sid, pcm in client_audio.items() if sid != uid]
+                    if host_audio is not None:
+                        others.append(host_audio)
+                    if others:
+                        mixed = self._mix_pcm(others)
+                        rms = np.sqrt(np.mean(np.frombuffer(mixed, dtype=np.int16).astype(np.float64) ** 2))
+                        log.log(TAG, f"[MIX->C{uid}] others={[sid for sid in client_audio if sid != uid]}+host={host_audio is not None} rms={rms:.0f}")
+                        try:
+                            self._send_callback(uid, mixed)
+                        except Exception as e:
+                            log.error(TAG, f"Send to {uid} error: {e}")
+
+            # 主机回放：播放所有客户端音频（不含主机自身麦克风）
+            host_mix_sources = list(client_audio.values())
+            if host_mix_sources:
+                host_mixed = self._mix_pcm(host_mix_sources)
+                with self._playback_lock:
+                    self._playback_buffer.append(host_mixed)
+                    if len(self._playback_buffer) > 10:
+                        self._playback_buffer = self._playback_buffer[-5:]
+
+            count += 1
+            if count % 50 == 1:
+                with self._client_lock:
+                    n_clients = len(self._client_ids)
+                log.log(TAG, f"[MIX] cycle#{count} client_srcs={list(client_audio.keys())} host_src={host_audio is not None} registered={n_clients}")
+
+        log.log(TAG, f"Mix loop stopped (total={count})")
 
     def _mix_pcm(self, pcm_list: list[bytes]) -> bytes:
         """混合多路 PCM：相加并截断。"""
@@ -223,18 +212,7 @@ class AudioMixer:
         mixed = np.clip(mixed, -32768, 32767).astype(np.int16)
         return mixed.tobytes()
 
-    def _broadcast_mixed(self, pcm_data: bytes) -> None:
-        """将混合音频广播给所有已注册客户端。"""
-        if not self._sock:
-            return
-        with self._addr_lock:
-            addrs = list(self._client_addrs.items())
-        for uid, addr in addrs:
-            try:
-                pkt = build_voice_packet(HOST_ID, 0, pcm_data)
-                self._sock.sendto(pkt, addr)
-            except OSError as e:
-                log.error(TAG, f"Send to {uid} error: {e}")
+    # _broadcast_mixed 已内联到 _mix_loop 中（每个客户端收到排除自身的混合）
 
     # ═════════════════════════════════════════
     # 主机音频回放
@@ -292,7 +270,6 @@ class AudioMixer:
                 if self._playback_buffer:
                     chunk = self._playback_buffer.pop(0)
             if chunk is None:
-                import time
                 time.sleep(0.005)
                 continue
             try:

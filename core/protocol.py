@@ -16,6 +16,7 @@ MSG_FILE_META: int = 0x02      # 文件元数据（文件名、大小、目标�
 MSG_FILE_CHUNK: int = 0x03     # 文件数据块
 MSG_SCREEN_FRAME: int = 0x04   # 投屏视频帧
 MSG_COMMAND: int = 0x05        # 控制信令
+MSG_VOICE: int = 0x06          # 语音数据（TCP 传输）
 
 # ─────────────────────────────────────────────
 # 控制命令子类型（存放在数据体首字节）

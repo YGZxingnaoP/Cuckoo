@@ -29,7 +29,7 @@ from core.server import Server
 from core.client import ClientConnection
 from core.protocol import (
     NicknameRegistry,
-    MSG_TEXT, MSG_FILE_META, MSG_FILE_CHUNK, MSG_SCREEN_FRAME, MSG_COMMAND,
+    MSG_TEXT, MSG_FILE_META, MSG_FILE_CHUNK, MSG_SCREEN_FRAME, MSG_COMMAND, MSG_VOICE,
     CMD_SCREEN_START, CMD_SCREEN_STOP, HOST_ID, BROADCAST_ID,
     build_frame
 )
@@ -185,12 +185,16 @@ class MainWindow(QMainWindow):
             # 注册文本消息处理器
             self._server.register_handler(MSG_TEXT, self._handle_text)
 
+            # 注册语音消息处理器
+            self._server.register_handler(MSG_VOICE, self._handle_voice)
+
             # 创建投屏模块
             self._screen_host = ScreenHost(self._server)
 
-            # 创建混音器
-            self._audio_mixer = AudioMixer(self._server)
+            # 创建混音器（使用 TCP 发送回调）
+            self._audio_mixer = AudioMixer(send_callback=self._send_voice_to_client)
             self._audio_mixer.start()
+            self._audio_mixer.start_playback()  # 自动开始回放，主机始终能听到房客声音
 
             # 创建文件处理器
             self._host_file = HostFileHandler(self._server)
@@ -280,8 +284,9 @@ class MainWindow(QMainWindow):
         self._chat_tab.setup(assigned_id, self._nicknames)
         self._chat_tab.append_system(f"已加入房间，你的ID是 {assigned_id}")
 
-        # 初始化音频（但不开启麦克风）
-        self._guest_audio = GuestAudio(self._peer_ip, assigned_id)
+        # 初始化音频（打开扬声器输出，但不开麦）
+        self._guest_audio = GuestAudio(self._client, assigned_id)
+        self._guest_audio.open_output()  # 立即可收听房主语音
 
         # 初始化文件接收器
         self._guest_file_recv = GuestFileReceiver()
@@ -344,6 +349,10 @@ class MainWindow(QMainWindow):
         elif msg_type == MSG_FILE_CHUNK:
             if self._guest_file_recv:
                 self._guest_file_recv.handle_file_chunk(sender_id, payload)
+        elif msg_type == MSG_VOICE:
+            # 收到房主发来的混合音频 → 播放
+            if self._guest_audio:
+                self._guest_audio.play_mixed_audio(payload)
 
     def _handle_text_guest(self, sender_id: int, payload: bytes) -> None:
         """房客处理文本消息。"""
@@ -368,6 +377,18 @@ class MainWindow(QMainWindow):
             self._chat_tab.append_message(sender_id, text)
         except UnicodeDecodeError:
             pass
+
+    def _handle_voice(self, msg_type: int, sender_id: int, target_id: int, payload: bytes) -> None:
+        """房主收到语音数据 → 推送给混音器。"""
+        if self._audio_mixer:
+            self._audio_mixer.push_client_audio(sender_id, payload)
+
+    def _send_voice_to_client(self, uid: int, pcm_data: bytes) -> None:
+        """混音器回调：通过 TCP 发送混合音频给指定房客。"""
+        if self._server:
+            frame = build_frame(MSG_VOICE, HOST_ID, uid, pcm_data)
+            self._server.send_to(uid, frame)
+            log.log(TAG, f"Voice->C{uid} len={len(pcm_data)}")
 
     # ═════════════════════════════════════════
     # 事件处理
@@ -417,15 +438,12 @@ class MainWindow(QMainWindow):
             self._toggle_guest_mic()
 
     def _toggle_host_mic(self) -> None:
-        """房主麦克风切换。"""
+        """房主麦克风切换（仅控制采集，回放始终开启）。"""
         if self._host_mic_running:
             self._host_mic_running = False
             self._voice_tab.set_mic_off()
             if self._host_mic_thread:
                 self._host_mic_thread.join(timeout=3)
-            # 停止回放
-            if self._audio_mixer:
-                self._audio_mixer.stop_playback()
             log.log(TAG, "Host mic off")
         else:
             if not self._audio_mixer:
@@ -433,8 +451,6 @@ class MainWindow(QMainWindow):
                 return
             self._host_mic_running = True
             self._voice_tab.set_mic_on()
-            # 启动回放（房主听混合音频）
-            self._audio_mixer.start_playback()
             self._host_mic_thread = threading.Thread(
                 target=self._host_mic_loop, daemon=True, name="HostMic"
             )
@@ -453,13 +469,19 @@ class MainWindow(QMainWindow):
                 input=True,
                 frames_per_buffer=config.AUDIO_CHUNK
             )
+            log.log(TAG, "Host mic loop started")
+            count = 0
             while self._host_mic_running:
                 pcm = stream.read(config.AUDIO_CHUNK, exception_on_overflow=False)
                 if self._audio_mixer:
                     self._audio_mixer.push_host_audio(pcm)
+                count += 1
+                if count % 50 == 1:
+                    log.log(TAG, f"[HOST-MIC] chunk#{count} len={len(pcm)}")
             stream.stop_stream()
             stream.close()
             pa.terminate()
+            log.log(TAG, f"Host mic loop stopped (total={count})")
         except Exception as e:
             log.error(TAG, f"Host mic error: {e}")
             self._host_mic_running = False
@@ -470,7 +492,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "尚未加入房间。")
             return
         if self._guest_audio.mic_on:
-            self._guest_audio.stop()
+            self._guest_audio.stop_mic()
             self._voice_tab.set_mic_off()
             log.log(TAG, "Guest mic off")
         else:
