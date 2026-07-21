@@ -3,12 +3,15 @@
 文件传输 —— 房客端接收器
 职责：
   接收房主转发来的文件（保存本地，支持文件夹结构）
+  内置异步写入线程，避免磁盘 IO 阻塞 UI 主线程。
 """
 
 import os
+import queue
 import struct
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
@@ -27,6 +30,14 @@ class IncomingTransfer:
     base_name: str  # 文件夹名（空=单文件）
     received: int = 0
     file_path: str = ""
+
+
+@dataclass
+class _WriteTask:
+    sender_id: int
+    payload: bytes
+    file_path: str
+    is_first_chunk: bool
 
 
 class GuestFileReceiver(QObject):
@@ -50,6 +61,94 @@ class GuestFileReceiver(QObject):
         self._start_times: dict[int, float] = {}
         self._last_reports: dict[int, float] = {}
         self._last_bytes_map: dict[int, int] = {}
+
+        # 异步写入队列与线程
+        self._write_queue: queue.Queue = queue.Queue()
+        self._write_thread: Optional[threading.Thread] = None
+        self._write_running = False
+        self._start_write_thread()
+
+    # ═════════════════════════════════════════
+    # 异步写入线程
+    # ═════════════════════════════════════════
+
+    def _start_write_thread(self) -> None:
+        """启动后台文件写入线程。"""
+        self._write_running = True
+        self._write_thread = threading.Thread(
+            target=self._write_loop, daemon=True, name="GuestFileWriter"
+        )
+        self._write_thread.start()
+        log.log(TAG, "Write thread started")
+
+    def _write_loop(self) -> None:
+        """写入线程：从队列取任务，执行磁盘写入。"""
+        while self._write_running:
+            try:
+                task = self._write_queue.get(timeout=0.5)
+                if task is None:  # 哨兵值
+                    break
+                self._do_write(task)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                log.error(TAG, f"Write loop error: {e}")
+        log.log(TAG, "Write thread stopped")
+
+    def _do_write(self, task: '_WriteTask') -> None:
+        """执行单个写入任务并处理进度/完成逻辑。"""
+        transfer = self._transfers.get(task.sender_id)
+        if transfer is None:
+            return
+
+        try:
+            os.makedirs(os.path.dirname(transfer.file_path), exist_ok=True)
+            mode = "wb" if task.is_first_chunk else "ab"
+            with open(transfer.file_path, mode) as f:
+                f.write(task.payload)
+            transfer.received += len(task.payload)
+
+            # 进度更新
+            if transfer.file_size > 0:
+                percent = min(100, int(transfer.received * 100 / transfer.file_size))
+                now = time.time()
+                last_report = self._last_reports.get(task.sender_id, now)
+                if now - last_report >= 1.0 or percent >= 100:
+                    elapsed = now - last_report
+                    last_b = self._last_bytes_map.get(task.sender_id, 0)
+                    speed = (transfer.received - last_b) / elapsed if elapsed > 0 else 0
+                    speed_str = self._format_speed(speed)
+                    remaining = transfer.file_size - transfer.received
+                    eta = remaining / speed if speed > 0 else 0
+                    eta_str = self._format_eta(eta)
+                    self.progress.emit(percent, speed_str, eta_str)
+                    self._last_reports[task.sender_id] = now
+                    self._last_bytes_map[task.sender_id] = transfer.received
+
+            # 完成检测
+            if transfer.received >= transfer.file_size:
+                if transfer.base_name:
+                    final_path = os.path.join(self._save_dir, transfer.base_name, transfer.filename)
+                else:
+                    final_path = os.path.join(self._save_dir, transfer.filename)
+                final_path = self._unique_path(final_path)
+                os.rename(transfer.file_path, final_path)
+                self.file_complete.emit(final_path)
+                display = f"{transfer.base_name}/{transfer.filename}" if transfer.base_name else transfer.filename
+                self.status_changed.emit(f"接收完成: {display}")
+                log.log(TAG, f"File saved: {final_path}")
+                del self._transfers[task.sender_id]
+                self._start_times.pop(task.sender_id, None)
+                self._last_reports.pop(task.sender_id, None)
+                self._last_bytes_map.pop(task.sender_id, None)
+
+        except OSError as e:
+            log.error(TAG, f"File write error: {e}")
+            self.status_changed.emit(f"写入失败: {e}")
+            self._transfers.pop(task.sender_id, None)
+            self._start_times.pop(task.sender_id, None)
+            self._last_reports.pop(task.sender_id, None)
+            self._last_bytes_map.pop(task.sender_id, None)
 
     def handle_file_meta(self, sender_id: int, payload: bytes) -> None:
         """处理文件元数据帧。"""
@@ -81,60 +180,19 @@ class GuestFileReceiver(QObject):
         self.status_changed.emit(f"正在接收: {display}")
 
     def handle_file_chunk(self, sender_id: int, payload: bytes) -> None:
-        """处理文件数据块帧。"""
+        """处理文件数据块帧（仅入队，由后台线程落盘，不阻塞 UI）。"""
         transfer = self._transfers.get(sender_id)
         if transfer is None:
             return
 
-        # 确保父目录存在
-        os.makedirs(os.path.dirname(transfer.file_path), exist_ok=True)
-
-        try:
-            with open(transfer.file_path, "ab" if transfer.received > 0 else "wb") as f:
-                f.write(payload)
-            transfer.received += len(payload)
-
-            # 进度更新
-            if transfer.file_size > 0:
-                percent = min(100, int(transfer.received * 100 / transfer.file_size))
-                now = time.time()
-                last_report = self._last_reports.get(sender_id, now)
-                if now - last_report >= 1.0 or percent >= 100:
-                    elapsed = now - last_report
-                    last_b = self._last_bytes_map.get(sender_id, 0)
-                    speed = (transfer.received - last_b) / elapsed if elapsed > 0 else 0
-                    speed_str = self._format_speed(speed)
-                    remaining = transfer.file_size - transfer.received
-                    eta = remaining / speed if speed > 0 else 0
-                    eta_str = self._format_eta(eta)
-                    self.progress.emit(percent, speed_str, eta_str)
-                    self._last_reports[sender_id] = now
-                    self._last_bytes_map[sender_id] = transfer.received
-
-            # 完成检测
-            if transfer.received >= transfer.file_size:
-                if transfer.base_name:
-                    final_path = os.path.join(self._save_dir, transfer.base_name, transfer.filename)
-                else:
-                    final_path = os.path.join(self._save_dir, transfer.filename)
-                final_path = self._unique_path(final_path)
-                os.rename(transfer.file_path, final_path)
-                self.file_complete.emit(final_path)
-                display = f"{transfer.base_name}/{transfer.filename}" if transfer.base_name else transfer.filename
-                self.status_changed.emit(f"接收完成: {display}")
-                log.log(TAG, f"File saved: {final_path}")
-                del self._transfers[sender_id]
-                self._start_times.pop(sender_id, None)
-                self._last_reports.pop(sender_id, None)
-                self._last_bytes_map.pop(sender_id, None)
-
-        except OSError as e:
-            log.error(TAG, f"File write error: {e}")
-            self.status_changed.emit(f"写入失败: {e}")
-            self._transfers.pop(sender_id, None)
-            self._start_times.pop(sender_id, None)
-            self._last_reports.pop(sender_id, None)
-            self._last_bytes_map.pop(sender_id, None)
+        is_first = (transfer.received == 0)
+        task = _WriteTask(
+            sender_id=sender_id,
+            payload=payload,
+            file_path=transfer.file_path,
+            is_first_chunk=is_first
+        )
+        self._write_queue.put(task)
 
     @staticmethod
     def _parse_meta(payload: bytes) -> Optional[tuple[str, str, int, int]]:
@@ -196,7 +254,12 @@ class GuestFileReceiver(QObject):
             return f"{s}s"
 
     def cleanup(self) -> None:
-        """清理未完成的 .part 文件。"""
+        """清理未完成的 .part 文件并停止写入线程。"""
+        # 停止写入线程
+        self._write_running = False
+        self._write_queue.put(None)
+        if self._write_thread:
+            self._write_thread.join(timeout=3)
         for transfer in self._transfers.values():
             try:
                 if os.path.exists(transfer.file_path):

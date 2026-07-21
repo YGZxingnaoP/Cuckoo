@@ -20,8 +20,8 @@ import config
 
 TAG = "AudioMixer"
 
-# 混音时间片（秒）—— 匹配 AUDIO_CHUNK / AUDIO_RATE = 64ms
-MIX_INTERVAL = 0.06  # 60ms（略小于 64ms，留处理余量）
+# 混音时间片（秒）—— 严格匹配 AUDIO_CHUNK / AUDIO_RATE = 1024/16000 = 64ms
+MIX_INTERVAL = 0.064  # 64ms（与采集帧长一致，避免缓冲区耗尽/溢出）
 
 
 class AudioMixer:

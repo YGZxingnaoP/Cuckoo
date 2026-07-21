@@ -2,9 +2,10 @@
 """
 星型拓扑 —— 房主端服务器
 职责：
-  1. 监听 TCP 端口，接受房客连接
-  2. 每连接一个接收线程 + 每客户端独立发送队列
+  1. 监听 TCP 端口，接受房客连接（主连接 + 独立语音连接）
+  2. 每连接独立收发线程 + 每客户端优先级发送队列
   3. 路由帧：文本广播、文件中转、投屏分发、信令处理
+  4. 语音通过独立 TCP 连接传输，解决队头阻塞
 """
 
 import socket
@@ -17,7 +18,7 @@ from typing import Optional, Callable
 from common import logger as log
 from core.protocol import (
     build_frame, read_frame, BROADCAST_ID, HOST_ID,
-    MSG_TEXT, MSG_FILE_META, MSG_FILE_CHUNK, MSG_SCREEN_FRAME, MSG_COMMAND,
+    MSG_TEXT, MSG_FILE_META, MSG_FILE_CHUNK, MSG_SCREEN_FRAME, MSG_COMMAND, MSG_VOICE,
     CMD_JOIN, CMD_JOIN_ACK, CMD_LEAVE, CMD_USER_LIST
 )
 import config
@@ -34,9 +35,19 @@ class ClientInfo:
     sock: socket.socket
     addr: tuple
     nickname: str = ""
-    send_queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=config.SEND_QUEUE_MAX))
+    # 优先级队列：信令/文本（高优先级，可丢旧帧）
+    priority_queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=config.SEND_QUEUE_MAX))
+    # 投屏队列（可丢弃旧帧）
+    media_queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=config.SEND_QUEUE_MAX))
+    # 文件块队列（严格FIFO，绝不丢弃）
+    file_queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=config.FILE_QUEUE_MAX))
     sender_thread: Optional[threading.Thread] = None
     receiver_thread: Optional[threading.Thread] = None
+    # 语音独立 TCP 连接
+    voice_sock: Optional[socket.socket] = None
+    voice_send_queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=config.SEND_QUEUE_MAX))
+    voice_sender_thread: Optional[threading.Thread] = None
+    voice_receiver_thread: Optional[threading.Thread] = None
 
 
 # ─────────────────────────────────────────────
@@ -53,6 +64,7 @@ class Server:
     def __init__(self, host_nickname: str = "房主"):
         self._host_nickname = host_nickname
         self._server_sock: Optional[socket.socket] = None
+        self._voice_server_sock: Optional[socket.socket] = None
         self._running = False
         self._clients_lock = threading.Lock()
         self._clients: dict[int, ClientInfo] = {}
@@ -93,31 +105,50 @@ class Server:
     # ═════════════════════════════════════════
 
     def start(self, bind_addr: str = "0.0.0.0", port: int = config.TCP_PORT) -> None:
-        """启动 TCP 服务器。"""
+        """启动 TCP 服务器（主连接 + 语音连接）。"""
+        # 主连接监听
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_sock.bind((bind_addr, port))
         self._server_sock.listen(config.MAX_CLIENTS)
         self._server_sock.settimeout(config.ACCEPT_TIMEOUT)
+
+        # 语音独立 TCP 监听
+        self._voice_server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._voice_server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._voice_server_sock.bind((bind_addr, config.VOICE_TCP_PORT))
+        self._voice_server_sock.listen(config.MAX_CLIENTS)
+        self._voice_server_sock.settimeout(config.ACCEPT_TIMEOUT)
+
         self._running = True
-        log.log(TAG, f"Server listening on {bind_addr}:{port}")
+        log.log(TAG, f"Server listening on {bind_addr}:{port} (main) + :{config.VOICE_TCP_PORT} (voice)")
 
         accept_thread = threading.Thread(
             target=self._accept_loop, daemon=True, name="ServerAccept"
         )
         accept_thread.start()
 
+        voice_accept_thread = threading.Thread(
+            target=self._voice_accept_loop, daemon=True, name="VoiceAccept"
+        )
+        voice_accept_thread.start()
+
     def stop(self) -> None:
         """停止服务器，断开所有客户端。"""
         self._running = False
 
-        # 关闭所有客户端
+        # 关闭所有客户端（主连接 + 语音连接）
         with self._clients_lock:
             for info in list(self._clients.values()):
                 try:
                     info.sock.close()
                 except OSError:
                     pass
+                if info.voice_sock:
+                    try:
+                        info.voice_sock.close()
+                    except OSError:
+                        pass
             self._clients.clear()
 
         # 关闭服务器 socket
@@ -127,6 +158,12 @@ class Server:
             except OSError:
                 pass
             self._server_sock = None
+        if self._voice_server_sock:
+            try:
+                self._voice_server_sock.close()
+            except OSError:
+                pass
+            self._voice_server_sock = None
 
         log.log(TAG, "Server stopped")
 
@@ -181,18 +218,151 @@ class Server:
 
         log.log(TAG, "Accept loop stopped")
 
-    def _sender_loop(self, info: ClientInfo) -> None:
-        """每客户端发送线程：从队列取帧并发送。"""
-        log.log(TAG, f"Sender started for client {info.uid}")
+    # ═════════════════════════════════════════
+    # 语音独立 TCP 连接
+    # ═════════════════════════════════════════
+
+    def _voice_accept_loop(self) -> None:
+        """语音 Accept 线程：等待客户端语音连接。"""
+        log.log(TAG, "Voice accept loop started")
         while self._running:
             try:
-                frame_bytes = info.send_queue.get(timeout=1.0)
-                if frame_bytes is None:  # 哨兵值，退出
+                voice_sock, addr = self._voice_server_sock.accept()
+                voice_sock.settimeout(None)
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._running:
+                    log.error(TAG, "Voice accept error")
+                break
+
+            # 读取 uid 标识帧（客户端连接后发送的第一个帧）
+            try:
+                voice_sock.settimeout(5.0)
+                uid_bytes = voice_sock.recv(4)
+                if not uid_bytes or len(uid_bytes) < 4:
+                    voice_sock.close()
+                    continue
+                uid = struct.unpack("!I", uid_bytes)[0]
+                voice_sock.settimeout(None)
+            except Exception as e:
+                log.error(TAG, f"Voice uid identification failed: {e}")
+                voice_sock.close()
+                continue
+
+            with self._clients_lock:
+                info = self._clients.get(uid)
+
+            if info is None:
+                log.warn(TAG, f"Voice connection for unknown client {uid}, rejecting")
+                voice_sock.close()
+                continue
+
+            info.voice_sock = voice_sock
+            log.log(TAG, f"Voice connection established for client {uid} from {addr}")
+
+            # 发送 ACK
+            try:
+                voice_sock.sendall(b"\x01")
+            except OSError:
+                pass
+
+            # 启动语音发送线程
+            vs = threading.Thread(
+                target=self._voice_sender_loop, args=(info,),
+                daemon=True, name=f"VoiceSender-{uid}"
+            )
+            info.voice_sender_thread = vs
+            vs.start()
+
+            # 启动语音接收线程
+            vr = threading.Thread(
+                target=self._voice_receiver_loop, args=(info,),
+                daemon=True, name=f"VoiceReceiver-{uid}"
+            )
+            info.voice_receiver_thread = vr
+            vr.start()
+
+        log.log(TAG, "Voice accept loop stopped")
+
+    def _voice_sender_loop(self, info: ClientInfo) -> None:
+        """每客户端语音发送线程：从语音队列取帧并发送。"""
+        log.log(TAG, f"Voice sender started for client {info.uid}")
+        while self._running:
+            try:
+                frame_bytes = info.voice_send_queue.get(timeout=1.0)
+                if frame_bytes is None:
                     break
-                # 背压处理：如果队列积压过多，丢弃旧帧
-                info.sock.sendall(frame_bytes)
+                info.voice_sock.sendall(frame_bytes)
             except queue.Empty:
                 continue
+            except (ConnectionError, OSError) as e:
+                log.error(TAG, f"Voice send error for client {info.uid}: {e}")
+                break
+        log.log(TAG, f"Voice sender stopped for client {info.uid}")
+
+    def _voice_receiver_loop(self, info: ClientInfo) -> None:
+        """每客户端语音接收线程：读取语音帧并推送混音器。"""
+        log.log(TAG, f"Voice receiver started for client {info.uid}")
+
+        def recv_exact(n: int) -> bytes:
+            buf = bytearray()
+            while len(buf) < n:
+                chunk = info.voice_sock.recv(n - len(buf))
+                if not chunk:
+                    raise ConnectionError("Voice connection closed")
+                buf.extend(chunk)
+            return bytes(buf)
+
+        try:
+            while self._running:
+                result = read_frame(recv_exact)
+                if result is None:
+                    break
+                msg_type, sender_id, target_id, payload = result
+                # 覆盖 sender_id 防止伪造
+                sender_id = info.uid
+                # 调用注册的语音处理器
+                if msg_type in self._handlers:
+                    self._handlers[msg_type](msg_type, sender_id, target_id, payload)
+        except (ConnectionError, OSError) as e:
+            log.error(TAG, f"Voice receiver error for client {info.uid}: {e}")
+        log.log(TAG, f"Voice receiver stopped for client {info.uid}")
+
+    def _sender_loop(self, info: ClientInfo) -> None:
+        """每客户端发送线程：从优先级队列取帧并发送（高优先级 > 投屏 > 文件）。"""
+        log.log(TAG, f"Sender started for client {info.uid}")
+        while self._running:
+            frame_bytes = None
+            try:
+                # 优先级 1：信令/文本（永不丢弃）
+                try:
+                    frame_bytes = info.priority_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+
+                # 优先级 2：投屏帧（可丢弃旧帧）
+                if frame_bytes is None:
+                    try:
+                        while True:
+                            frame_bytes = info.media_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+
+                # 优先级 3：文件块（严格FIFO，不丢弃）
+                if frame_bytes is None:
+                    try:
+                        frame_bytes = info.file_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+
+                if frame_bytes is None:
+                    continue
+                if frame_bytes is False:  # 哨兵值
+                    break
+
+                info.sock.sendall(frame_bytes)
+
             except (ConnectionError, OSError) as e:
                 log.error(TAG, f"Send error for client {info.uid}: {e}")
                 break
@@ -312,11 +482,11 @@ class Server:
     # 发送 API
     # ═════════════════════════════════════════
 
-    def send_to(self, uid: int, frame_bytes: bytes) -> None:
-        """向指定客户端排队发送帧。"""
-        self._queue_bytes(uid, frame_bytes)
+    def send_to(self, uid: int, frame_bytes: bytes, msg_type: int = 0) -> None:
+        """向指定客户端排队发送帧（根据 msg_type 路由到对应队列）。"""
+        self._queue_bytes(uid, frame_bytes, msg_type)
 
-    def broadcast(self, frame_bytes: bytes, exclude: set = None) -> None:
+    def broadcast(self, frame_bytes: bytes, exclude: set = None, msg_type: int = 0) -> None:
         """广播帧给所有客户端（可排除指定 ID）。"""
         exclude = exclude or set()
         # 取快照以避免持锁时间过长
@@ -324,35 +494,54 @@ class Server:
             targets = list(self._clients.values())
         for info in targets:
             if info.uid not in exclude:
-                self._queue_bytes(info.uid, frame_bytes)
+                self._queue_bytes(info.uid, frame_bytes, msg_type)
 
     def broadcast_from(self, sender_id: int, msg_type: int, payload: bytes) -> None:
         """将某用户的消息广播给其他所有用户（含房主自身由 handler 处理）。"""
         frame = build_frame(msg_type, sender_id, BROADCAST_ID, payload)
         self.broadcast(frame, exclude={sender_id})
 
-    def _queue_bytes(self, uid: int, frame_bytes: bytes) -> None:
-        """向指定客户端的发送队列放入数据。"""
+    def _queue_bytes(self, uid: int, frame_bytes: bytes, msg_type: int = 0) -> None:
+        """根据消息类型将数据路由到对应优先级队列。"""
         with self._clients_lock:
             info = self._clients.get(uid)
         if info is None:
             return
+
+        # 根据消息类型选择目标队列
+        if msg_type == MSG_SCREEN_FRAME:
+            target_q = info.media_queue
+            can_drop = True
+        elif msg_type in (MSG_FILE_META, MSG_FILE_CHUNK):
+            target_q = info.file_queue
+            can_drop = False  # 文件块绝不丢弃
+        else:
+            # 文本、信令等 -> 高优先级
+            target_q = info.priority_queue
+            can_drop = True
+
         try:
-            if info.send_queue.full():
+            if can_drop and target_q.full():
                 try:
-                    info.send_queue.get_nowait()  # 丢弃旧帧
+                    target_q.get_nowait()  # 丢弃旧投屏帧
                 except queue.Empty:
                     pass
-            info.send_queue.put_nowait(frame_bytes)
+            target_q.put_nowait(frame_bytes)
         except queue.Full:
-            pass
+            if not can_drop:
+                # 文件队列满：阻塞等待最多 2 秒
+                try:
+                    target_q.put(frame_bytes, timeout=2.0)
+                except queue.Full:
+                    log.warn(TAG, f"File queue full for client {uid}, dropping chunk")
+            # 高优先级队列满已在上层处理（丢弃旧帧）
 
     # ═════════════════════════════════════════
     # 客户端清理
     # ═════════════════════════════════════════
 
     def _remove_client(self, uid: int) -> None:
-        """清理断开连接的客户端。"""
+        """清理断开连接的客户端（主连接 + 语音连接）。"""
         with self._clients_lock:
             info = self._clients.pop(uid, None)
 
@@ -362,14 +551,28 @@ class Server:
         nickname = info.nickname or f"房客{uid}"
         log.log(TAG, f"Removing client {uid} ({nickname})")
 
+        # 关闭主连接
         try:
             info.sock.close()
         except OSError:
             pass
 
-        # 停止发送线程
+        # 关闭语音连接
+        if info.voice_sock:
+            try:
+                info.voice_sock.close()
+            except OSError:
+                pass
+
+        # 停止主发送线程
         try:
-            info.send_queue.put_nowait(None)
+            info.priority_queue.put_nowait(False)  # 哨兵值
+        except queue.Full:
+            pass
+
+        # 停止语音发送线程
+        try:
+            info.voice_send_queue.put_nowait(None)
         except queue.Full:
             pass
 

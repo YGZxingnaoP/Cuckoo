@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal
 
+import socket
 import config
 from common import logger as log
 from common import network
@@ -67,6 +68,7 @@ class MainWindow(QMainWindow):
     _client_event = Signal(str)  # 房客加入/离开事件文本
     _targets_changed = Signal(list)  # 房客加入/离开时更新目标列表
     _online_users_changed = Signal(dict)  # 在线用户列表变更 {uid: nickname}
+    _voice_data_received = Signal(bytes)  # 语音独立 TCP 接收到的混合音频
 
     # 房主断开连接信号（房客端专用）
     host_disconnected = Signal()
@@ -98,6 +100,11 @@ class MainWindow(QMainWindow):
         # 主机麦克风采集线程
         self._host_mic_running = False
         self._host_mic_thread: Optional[threading.Thread] = None
+
+        # 语音独立 TCP 连接（房客端）
+        self._voice_sock: Optional[socket.socket] = None
+        self._voice_send_thread: Optional[threading.Thread] = None
+        self._voice_recv_thread: Optional[threading.Thread] = None
 
         self._init_ui()
         self._start_services()
@@ -171,6 +178,9 @@ class MainWindow(QMainWindow):
 
         # 音量增益信号
         self._voice_tab.volume_gain_changed.connect(self._on_volume_gain_changed)
+
+        # 语音数据接收信号（从独立 TCP 线程发出）
+        self._voice_data_received.connect(self._on_voice_data_received)
 
     # ═════════════════════════════════════════
     # 服务启动
@@ -299,8 +309,11 @@ class MainWindow(QMainWindow):
         self._chat_tab.setup(assigned_id, self._nicknames)
         self._chat_tab.append_system(f"已加入房间，你的ID是 {assigned_id}")
 
+        # 建立独立语音 TCP 连接
+        self._connect_voice_tcp(assigned_id)
+
         # 初始化音频（打开扬声器输出，但不开麦）
-        self._guest_audio = GuestAudio(self._client, assigned_id)
+        self._guest_audio = GuestAudio(self._client, assigned_id, self._voice_sock)
         self._guest_audio.open_output()  # 立即可收听房主语音
 
         # 初始化文件接收器
@@ -348,16 +361,95 @@ class MainWindow(QMainWindow):
         """连接断开——房客跳回启动界面。"""
         self._status_bar.showMessage("与房主断开连接")
         self._screen_tab.stop_streaming()
+        self._close_voice_tcp()
         QMessageBox.warning(self, "连接断开", "与房主的连接已断开，将返回启动界面。")
         self.host_disconnected.emit()
         self.close()
+
+    # ═════════════════════════════════════════
+    # 语音独立 TCP 连接（房客端）
+    # ═════════════════════════════════════════
+
+    def _connect_voice_tcp(self, assigned_id: int) -> None:
+        """建立独立语音 TCP 连接并启动收发线程。"""
+        try:
+            self._voice_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._voice_sock.settimeout(5.0)
+            self._voice_sock.connect((self._peer_ip, config.VOICE_TCP_PORT))
+            self._voice_sock.settimeout(None)
+
+            # 发送 uid 标识
+            self._voice_sock.sendall(struct.pack("!I", assigned_id))
+
+            # 读取 ACK
+            ack = self._voice_sock.recv(1)
+            if not ack:
+                raise ConnectionError("Voice TCP: no ACK from server")
+
+            log.log(TAG, f"Voice TCP connected on port {config.VOICE_TCP_PORT}")
+
+            # 启动语音接收线程
+            self._voice_recv_thread = threading.Thread(
+                target=self._voice_recv_loop, daemon=True, name="GuestVoiceRecv"
+            )
+            self._voice_recv_thread.start()
+
+        except Exception as e:
+            log.error(TAG, f"Voice TCP connection failed: {e}")
+            self._voice_sock = None
+
+    def _voice_recv_loop(self) -> None:
+        """语音接收线程：从独立 TCP 连接读取混合音频并通过信号分发给 UI。"""
+        from core.protocol import read_frame as proto_read_frame
+        log.log(TAG, "Voice recv loop started")
+
+        def recv_exact(n: int) -> bytes:
+            buf = bytearray()
+            while len(buf) < n:
+                chunk = self._voice_sock.recv(n - len(buf))
+                if not chunk:
+                    raise ConnectionError("Voice TCP closed")
+                buf.extend(chunk)
+            return bytes(buf)
+
+        try:
+            while self._voice_sock:
+                result = proto_read_frame(recv_exact)
+                if result is None:
+                    break
+                msg_type, sender_id, target_id, payload = result
+                if msg_type == MSG_VOICE:
+                    self._voice_data_received.emit(payload)
+        except (ConnectionError, OSError) as e:
+            log.error(TAG, f"Voice recv error: {e}")
+        log.log(TAG, "Voice recv loop stopped")
+
+    def _on_voice_data_received(self, pcm_data: bytes) -> None:
+        """主线程槽：播放从语音 TCP 收到的混合音频。"""
+        if self._guest_audio:
+            self._guest_audio.play_mixed_audio(pcm_data)
+
+    def _close_voice_tcp(self) -> None:
+        """关闭语音 TCP 连接。"""
+        if self._voice_sock:
+            try:
+                self._voice_sock.close()
+            except OSError:
+                pass
+            self._voice_sock = None
+        if self._voice_recv_thread:
+            self._voice_recv_thread.join(timeout=2)
+            self._voice_recv_thread = None
+        if self._voice_send_thread:
+            self._voice_send_thread.join(timeout=2)
+            self._voice_send_thread = None
 
     # ═════════════════════════════════════════
     # 帧处理（房客端）
     # ═════════════════════════════════════════
 
     def _on_frame_received(self, msg_type: int, sender_id: int, target_id: int, payload: bytes) -> None:
-        """房客收到帧（由 ClientConnection 分发）。"""
+        """房客收到帧（由 ClientConnection 主 TCP 分发，语音已通过独立 TCP 处理）。"""
         if msg_type == MSG_TEXT:
             self._handle_text_guest(sender_id, payload)
         elif msg_type == MSG_SCREEN_FRAME:
@@ -369,10 +461,6 @@ class MainWindow(QMainWindow):
         elif msg_type == MSG_FILE_CHUNK:
             if self._guest_file_recv:
                 self._guest_file_recv.handle_file_chunk(sender_id, payload)
-        elif msg_type == MSG_VOICE:
-            # 收到房主发来的混合音频 → 播放
-            if self._guest_audio:
-                self._guest_audio.play_mixed_audio(payload)
 
     def _handle_text_guest(self, sender_id: int, payload: bytes) -> None:
         """房客处理文本消息。"""
@@ -390,7 +478,7 @@ class MainWindow(QMainWindow):
         """房主收到文本消息 → 广播给所有人。"""
         # 广播给其他房客
         broadcast_frame = build_frame(MSG_TEXT, sender_id, BROADCAST_ID, payload)
-        self._server.broadcast(broadcast_frame, exclude={sender_id})
+        self._server.broadcast(broadcast_frame, exclude={sender_id}, msg_type=MSG_TEXT)
         # 房主自己也显示
         try:
             text = payload.decode("utf-8")
@@ -404,11 +492,21 @@ class MainWindow(QMainWindow):
             self._audio_mixer.push_client_audio(sender_id, payload)
 
     def _send_voice_to_client(self, uid: int, pcm_data: bytes) -> None:
-        """混音器回调：通过 TCP 发送混合音频给指定房客。"""
+        """混音器回调：通过独立语音 TCP 发送混合音频给指定房客。"""
         if self._server:
-            frame = build_frame(MSG_VOICE, HOST_ID, uid, pcm_data)
-            self._server.send_to(uid, frame)
-            log.log(TAG, f"Voice->C{uid} len={len(pcm_data)}")
+            with self._server._clients_lock:
+                info = self._server._clients.get(uid)
+            if info and info.voice_sock:
+                frame = build_frame(MSG_VOICE, HOST_ID, uid, pcm_data)
+                try:
+                    if info.voice_send_queue.full():
+                        try:
+                            info.voice_send_queue.get_nowait()
+                        except Exception:
+                            pass
+                    info.voice_send_queue.put_nowait(frame)
+                except Exception:
+                    pass
 
     # ═════════════════════════════════════════
     # 事件处理
@@ -425,7 +523,7 @@ class MainWindow(QMainWindow):
             if self._server:
                 stop_frame = build_frame(MSG_COMMAND, HOST_ID, BROADCAST_ID,
                                          bytes([CMD_SCREEN_STOP]))
-                self._server.broadcast(stop_frame)
+                self._server.broadcast(stop_frame, msg_type=MSG_COMMAND)
             log.log(TAG, "Screen sharing stopped")
         else:
             if self._screen_host:
@@ -435,7 +533,7 @@ class MainWindow(QMainWindow):
                 if self._server:
                     start_frame = build_frame(MSG_COMMAND, HOST_ID, BROADCAST_ID,
                                               bytes([CMD_SCREEN_START]))
-                    self._server.broadcast(start_frame)
+                    self._server.broadcast(start_frame, msg_type=MSG_COMMAND)
                 log.log(TAG, "Screen sharing started")
             else:
                 QMessageBox.warning(self, "提示", "服务器尚未就绪。")
@@ -462,12 +560,18 @@ class MainWindow(QMainWindow):
         if self._host_mic_running:
             self._host_mic_running = False
             self._voice_tab.set_mic_off()
-            # 不 join——让采集线程自然退出，避免阻塞 UI
+            # 等待采集线程彻底退出并释放 PyAudio 资源
+            if self._host_mic_thread and self._host_mic_thread.is_alive():
+                self._host_mic_thread.join(timeout=3)
+            self._host_mic_thread = None
             log.log(TAG, "Host mic off")
         else:
             if not self._audio_mixer:
                 QMessageBox.warning(self, "提示", "混音器未就绪。")
                 return
+            # 确保上一个采集线程已退出
+            if self._host_mic_thread and self._host_mic_thread.is_alive():
+                self._host_mic_thread.join(timeout=3)
             self._host_mic_running = True
             self._voice_tab.set_mic_on()
             self._host_mic_thread = threading.Thread(
@@ -527,7 +631,7 @@ class MainWindow(QMainWindow):
         if self._is_host and self._server:
             # 房主：直接广播
             frame = build_frame(MSG_TEXT, HOST_ID, BROADCAST_ID, data)
-            self._server.broadcast(frame)
+            self._server.broadcast(frame, msg_type=MSG_TEXT)
         elif self._client:
             # 房客：发送给房主，由房主广播
             self._client.send_frame(MSG_TEXT, HOST_ID, data)
@@ -587,7 +691,7 @@ class MainWindow(QMainWindow):
             display = f"{base_name}/{filename}" if base_name else filename
             self._send_status.emit(f"正在发送: {display}")
 
-            # 数据块
+            # 数据块（自适应限速：监控发送队列深度）
             import time
             with open(file_path, "rb") as f:
                 while True:
@@ -595,7 +699,9 @@ class MainWindow(QMainWindow):
                     if not chunk:
                         break
                     self._client.send_frame(MSG_FILE_CHUNK, BROADCAST_ID, chunk)
-                    time.sleep(config.FILE_SEND_DELAY)
+                    # 自适应限速：队列积压时等待，空闲时快速发送
+                    while self._client._send_queue.qsize() > config.SEND_QUEUE_MAX * 2:
+                        time.sleep(0.005)
 
             self._send_status.emit(f"发送完成: {display}")
             self._send_progress.emit(100, "完成", "")
@@ -638,14 +744,15 @@ class MainWindow(QMainWindow):
                 self._client.send_frame(MSG_FILE_META, BROADCAST_ID, bytes(meta))
                 self._send_status.emit(f"[{idx}/{total}] {rel_path}")
 
-                # 数据块
+                # 数据块（自适应限速）
                 with open(full_path, "rb") as f:
                     while True:
                         chunk = f.read(config.FILE_CHUNK_SIZE)
                         if not chunk:
                             break
                         self._client.send_frame(MSG_FILE_CHUNK, BROADCAST_ID, chunk)
-                        time.sleep(config.FILE_SEND_DELAY)
+                        while self._client._send_queue.qsize() > config.SEND_QUEUE_MAX * 2:
+                            time.sleep(0.005)
 
                 time.sleep(0.01)
 
@@ -700,6 +807,9 @@ class MainWindow(QMainWindow):
         self._host_mic_running = False
         if self._host_mic_thread:
             self._host_mic_thread.join(timeout=3)
+
+        # 关闭语音 TCP 连接
+        self._close_voice_tcp()
 
         # 停止文件传输
         if self._host_file:

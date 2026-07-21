@@ -8,6 +8,7 @@
 """
 
 import os
+import queue
 import struct
 import threading
 import time
@@ -38,6 +39,14 @@ class IncomingTransfer:
     base_name: str = ""  # 文件夹名（空=单文件）
 
 
+@dataclass
+class _WriteTask:
+    sender_id: int
+    payload: bytes
+    file_path: str
+    is_first_chunk: bool
+
+
 class HostFileHandler(QObject):
     """
     主机文件处理器。
@@ -59,9 +68,83 @@ class HostFileHandler(QObject):
         self._transfers: dict[int, IncomingTransfer] = {}  # sender_id -> transfer
         self._transfers_lock = threading.Lock()  # 保护并发访问
 
+        # 异步写入队列与线程
+        self._write_queue: queue.Queue = queue.Queue()
+        self._write_thread: Optional[threading.Thread] = None
+        self._write_running = False
+        self._start_write_thread()
+
         # 注册消息处理器
         server.register_handler(MSG_FILE_META, self._handle_meta)
         server.register_handler(MSG_FILE_CHUNK, self._handle_chunk)
+
+    # ═════════════════════════════════════════
+    # 异步写入线程
+    # ═════════════════════════════════════════
+
+    def _start_write_thread(self) -> None:
+        """启动后台文件写入线程。"""
+        self._write_running = True
+        self._write_thread = threading.Thread(
+            target=self._write_loop, daemon=True, name="HostFileWriter"
+        )
+        self._write_thread.start()
+        log.log(TAG, "Write thread started")
+
+    def _write_loop(self) -> None:
+        """写入线程：从队列取任务，执行磁盘写入。"""
+        while self._write_running:
+            try:
+                task = self._write_queue.get(timeout=0.5)
+                if task is None:  # 哨兵值
+                    break
+                self._do_write(task)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                log.error(TAG, f"Write loop error: {e}")
+        log.log(TAG, "Write thread stopped")
+
+    def _do_write(self, task: '_WriteTask') -> None:
+        """执行单个写入任务并处理进度/完成逻辑。"""
+        with self._transfers_lock:
+            transfer = self._transfers.get(task.sender_id)
+        if transfer is None:
+            return
+
+        try:
+            os.makedirs(os.path.dirname(transfer.file_path), exist_ok=True)
+            mode = "wb" if task.is_first_chunk else "ab"
+            with open(transfer.file_path, mode) as f:
+                f.write(task.payload)
+            transfer.received += len(task.payload)
+
+            # 进度更新（每 10 个块或接近完成时）
+            if transfer.file_size > 0:
+                percent = min(100, int(transfer.received * 100 / transfer.file_size))
+                if percent >= 100 or transfer.received % (config.FILE_CHUNK_SIZE * 10) < len(task.payload):
+                    self.progress.emit(percent, "", "")
+
+            # 完成检测
+            if transfer.received >= transfer.file_size:
+                if transfer.base_name:
+                    final_path = os.path.join(self._save_dir, transfer.base_name, transfer.filename)
+                else:
+                    final_path = os.path.join(self._save_dir, transfer.filename)
+                final_path = self._unique_path(final_path)
+                os.rename(transfer.file_path, final_path)
+                self.file_complete.emit(final_path)
+                display = f"{transfer.base_name}/{transfer.filename}" if transfer.base_name else transfer.filename
+                self.status_changed.emit(f"接收完成: {display}")
+                log.log(TAG, f"File saved: {final_path}")
+                with self._transfers_lock:
+                    self._transfers.pop(task.sender_id, None)
+
+        except OSError as e:
+            log.error(TAG, f"File write error: {e}")
+            self.status_changed.emit(f"写入失败: {e}")
+            with self._transfers_lock:
+                self._transfers.pop(task.sender_id, None)
 
     # ═════════════════════════════════════════
     # 接收文件元数据
@@ -98,7 +181,7 @@ class HostFileHandler(QObject):
         else:
             # 发给其他房客 → 中转：转发元数据
             relay_frame = build_frame(MSG_FILE_META, sender_id, actual_target, payload)
-            self._server.send_to(actual_target, relay_frame)
+            self._server.send_to(actual_target, relay_frame, MSG_FILE_META)
             log.log(TAG, f"Relaying file meta to {actual_target}")
 
     # ═════════════════════════════════════════
@@ -106,51 +189,25 @@ class HostFileHandler(QObject):
     # ═════════════════════════════════════════
 
     def _handle_chunk(self, msg_type: int, sender_id: int, target_id: int, payload: bytes) -> None:
-        """处理文件数据块帧。"""
+        """处理文件数据块帧（本地写入异步入队，中转立即转发）。"""
         with self._transfers_lock:
             transfer = self._transfers.get(sender_id)
         if transfer is None:
             # 可能是中转
             if target_id != HOST_ID and target_id != BROADCAST_ID:
                 relay_frame = build_frame(MSG_FILE_CHUNK, sender_id, target_id, payload)
-                self._server.send_to(target_id, relay_frame)
+                self._server.send_to(target_id, relay_frame, MSG_FILE_CHUNK)
             return
 
-        # 确保父目录存在
-        os.makedirs(os.path.dirname(transfer.file_path), exist_ok=True)
-
-        # 写入本地文件
-        try:
-            with open(transfer.file_path, "ab" if transfer.received > 0 else "wb") as f:
-                f.write(payload)
-            transfer.received += len(payload)
-
-            # 进度更新（每 10 个块或接近完成时）
-            if transfer.file_size > 0:
-                percent = min(100, int(transfer.received * 100 / transfer.file_size))
-                if percent >= 100 or transfer.received % (config.FILE_CHUNK_SIZE * 10) < len(payload):
-                    self.progress.emit(percent, "", "")
-
-            # 完成检测
-            if transfer.received >= transfer.file_size:
-                if transfer.base_name:
-                    final_path = os.path.join(self._save_dir, transfer.base_name, transfer.filename)
-                else:
-                    final_path = os.path.join(self._save_dir, transfer.filename)
-                final_path = self._unique_path(final_path)
-                os.rename(transfer.file_path, final_path)
-                self.file_complete.emit(final_path)
-                display = f"{transfer.base_name}/{transfer.filename}" if transfer.base_name else transfer.filename
-                self.status_changed.emit(f"接收完成: {display}")
-                log.log(TAG, f"File saved: {final_path}")
-                with self._transfers_lock:
-                    self._transfers.pop(sender_id, None)
-
-        except OSError as e:
-            log.error(TAG, f"File write error: {e}")
-            self.status_changed.emit(f"写入失败: {e}")
-            with self._transfers_lock:
-                self._transfers.pop(sender_id, None)
+        # 本地接收：异步入队，不阻塞 Server 接收线程
+        is_first = (transfer.received == 0)
+        task = _WriteTask(
+            sender_id=sender_id,
+            payload=payload,
+            file_path=transfer.file_path,
+            is_first_chunk=is_first
+        )
+        self._write_queue.put(task)
 
     # ═════════════════════════════════════════
     # 主机发送文件
@@ -190,7 +247,7 @@ class HostFileHandler(QObject):
             meta.extend(struct.pack("!I", target_id))
 
             meta_frame = build_frame(MSG_FILE_META, HOST_ID, target_id, bytes(meta))
-            self._server.send_to(target_id, meta_frame)
+            self._server.send_to(target_id, meta_frame, MSG_FILE_META)
 
             display = f"{base_name}/{filename}" if base_name else filename
             log.log(TAG, f"Sending {display} ({file_size} bytes) to {target_id}")
@@ -208,11 +265,15 @@ class HostFileHandler(QObject):
                     if not chunk:
                         break
                     chunk_frame = build_frame(MSG_FILE_CHUNK, HOST_ID, target_id, chunk)
-                    self._server.send_to(target_id, chunk_frame)
+                    self._server.send_to(target_id, chunk_frame, MSG_FILE_CHUNK)
                     sent += len(chunk)
 
-                    # 限速
-                    time.sleep(config.FILE_SEND_DELAY)
+                    # 自适应限速：监控文件队列深度，队列积压时等待，空闲时快速发送
+                    with self._server._clients_lock:
+                        client_info = self._server._clients.get(target_id)
+                    if client_info:
+                        while client_info.file_queue.qsize() > config.FILE_QUEUE_MAX // 2:
+                            time.sleep(0.005)
 
                     # 进度更新
                     now = time.time()
@@ -264,19 +325,24 @@ class HostFileHandler(QObject):
                 meta.extend(struct.pack("!I", target_id))
 
                 meta_frame = build_frame(MSG_FILE_META, HOST_ID, target_id, bytes(meta))
-                self._server.send_to(target_id, meta_frame)
+                self._server.send_to(target_id, meta_frame, MSG_FILE_META)
 
                 self.status_changed.emit(f"[{idx}/{total}] {rel_path}")
 
-                # 发送数据块
+                # 发送数据块（自适应限速）
                 with open(full_path, "rb") as f:
                     while True:
                         chunk = f.read(config.FILE_CHUNK_SIZE)
                         if not chunk:
                             break
                         chunk_frame = build_frame(MSG_FILE_CHUNK, HOST_ID, target_id, chunk)
-                        self._server.send_to(target_id, chunk_frame)
-                        time.sleep(config.FILE_SEND_DELAY)
+                        self._server.send_to(target_id, chunk_frame, MSG_FILE_CHUNK)
+                        # 自适应限速：监控文件队列深度
+                        with self._server._clients_lock:
+                            client_info = self._server._clients.get(target_id)
+                        if client_info:
+                            while client_info.file_queue.qsize() > config.FILE_QUEUE_MAX // 2:
+                                time.sleep(0.005)
 
                 # 文件间短暂间隔
                 time.sleep(0.01)
@@ -354,7 +420,12 @@ class HostFileHandler(QObject):
             return f"{s}s"
 
     def cleanup(self) -> None:
-        """清理未完成的 .part 文件。"""
+        """清理未完成的 .part 文件并停止写入线程。"""
+        # 停止写入线程
+        self._write_running = False
+        self._write_queue.put(None)
+        if self._write_thread:
+            self._write_thread.join(timeout=3)
         with self._transfers_lock:
             transfers_snapshot = list(self._transfers.values())
             self._transfers.clear()

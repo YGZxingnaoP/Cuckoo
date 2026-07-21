@@ -93,9 +93,9 @@ class ScreenHost:
                 _, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, config.JPEG_QUALITY])
                 frame_data = jpeg.tobytes()
 
-                # 构建帧并广播
+                # 构建帧并广播（传入 msg_type 以路由到投屏队列）
                 frame = build_frame(MSG_SCREEN_FRAME, HOST_ID, BROADCAST_ID, frame_data)
-                self._server.broadcast(frame)
+                self._server.broadcast(frame, msg_type=MSG_SCREEN_FRAME)
 
                 # 帧率控制
                 elapsed = time.perf_counter() - t0

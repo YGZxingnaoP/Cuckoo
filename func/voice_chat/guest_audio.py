@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-语音模块 —— 房客端音频收发（TCP 传输）
+语音模块 —— 房客端音频收发（独立 TCP 传输）
 职责：
-  1. 麦克风采集 → 通过 ClientConnection TCP 发送给房主
-  2. 从房主接收混合音频（TCP）→ 扬声器播放
+  1. 麦克风采集 → 通过独立语音 TCP Socket 发送给房主
+  2. 从房主接收混合音频（独立语音 TCP）→ 扬声器播放
 """
 
+import socket
 import queue
 import threading
 from typing import Optional
@@ -14,6 +15,7 @@ import numpy as np
 import pyaudio
 
 from common import logger as log
+from core.protocol import build_frame, MSG_VOICE, HOST_ID
 import config
 
 TAG = "GuestAudio"
@@ -26,13 +28,15 @@ class GuestAudio:
     - 从房主接收混合音频并通过独立播放线程播放
     """
 
-    def __init__(self, client_conn, client_id: int = 0):
+    def __init__(self, client_conn, client_id: int = 0, voice_sock: Optional[socket.socket] = None):
         """
-        :param client_conn: ClientConnection 实例，用于 TCP 收发
+        :param client_conn: ClientConnection 实例（备用）
         :param client_id: 本房客被分配的 ID
+        :param voice_sock: 独立语音 TCP Socket
         """
         self._client_conn = client_conn
         self._client_id = client_id
+        self._voice_sock = voice_sock
         self._running = False
         self._pa: Optional[pyaudio.PyAudio] = None
         self._input_stream: Optional[pyaudio.Stream] = None
@@ -182,15 +186,17 @@ class GuestAudio:
     # ═════════════════════════════════════════
 
     def _send_loop(self) -> None:
-        log.log(TAG, "Send loop started (TCP)")
+        log.log(TAG, "Send loop started (Voice TCP)")
         count = 0
         while self._running and self._mic_on:
             try:
                 pcm_data = self._input_stream.read(
                     config.AUDIO_CHUNK, exception_on_overflow=False
                 )
-                # 通过 ClientConnection TCP 发送语音帧
-                self._client_conn.send_frame(0x06, 0, pcm_data)  # MSG_VOICE=0x06, target=HOST
+                # 通过独立语音 TCP Socket 发送语音帧
+                if self._voice_sock:
+                    frame = build_frame(MSG_VOICE, self._client_id, HOST_ID, pcm_data)
+                    self._voice_sock.sendall(frame)
                 count += 1
                 if count % 50 == 1:
                     rms = np.sqrt(np.mean(np.frombuffer(pcm_data, dtype=np.int16).astype(np.float64) ** 2))
