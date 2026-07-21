@@ -198,7 +198,7 @@ class MainWindow(QMainWindow):
     # ─────────────────────────────────────────
 
     def _start_host_services(self) -> None:
-        """房主：启动 TCP 服务器 + UDP 混音器。"""
+        """房主：启动 TCP 服务器 + TCP 混音器。"""
         try:
             # 创建 Server
             self._server = Server(host_nickname=self._nickname)

@@ -258,6 +258,19 @@ class Server:
                 voice_sock.close()
                 continue
 
+            # 关闭旧语音连接（防止重复连接导致资源泄漏）
+            if info.voice_sock is not None:
+                log.warn(TAG, f"Replacing existing voice connection for client {uid}")
+                try:
+                    info.voice_sock.close()
+                except OSError:
+                    pass
+                # 停止旧的语音发送线程
+                try:
+                    info.voice_send_queue.put_nowait(None)
+                except queue.Full:
+                    pass
+
             info.voice_sock = voice_sock
             log.log(TAG, f"Voice connection established for client {uid} from {addr}")
 
@@ -335,13 +348,13 @@ class Server:
         while self._running:
             frame_bytes = None
             try:
-                # 优先级 1：信令/文本（永不丢弃）
+                # 优先级 1：信令/文本（非阻塞检查）
                 try:
-                    frame_bytes = info.priority_queue.get(timeout=1.0)
+                    frame_bytes = info.priority_queue.get_nowait()
                 except queue.Empty:
-                    continue
+                    pass
 
-                # 优先级 2：投屏帧（可丢弃旧帧）
+                # 优先级 2：投屏帧（可丢弃旧帧，非阻塞）
                 if frame_bytes is None:
                     try:
                         while True:
@@ -349,15 +362,20 @@ class Server:
                     except queue.Empty:
                         pass
 
-                # 优先级 3：文件块（严格FIFO，不丢弃）
+                # 优先级 3：文件块（严格FIFO，不丢弃，非阻塞）
                 if frame_bytes is None:
                     try:
                         frame_bytes = info.file_queue.get_nowait()
                     except queue.Empty:
                         pass
 
+                # 所有队列均为空，阻塞等待高优先级队列（避免忙循环）
                 if frame_bytes is None:
-                    continue
+                    try:
+                        frame_bytes = info.priority_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+
                 if frame_bytes is False:  # 哨兵值
                     break
 

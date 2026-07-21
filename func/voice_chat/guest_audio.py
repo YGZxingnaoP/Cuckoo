@@ -24,7 +24,7 @@ TAG = "GuestAudio"
 class GuestAudio:
     """
     房客音频处理器（TCP 模式）。
-    - 麦克风采集通过 ClientConnection TCP 发送给房主
+    - 麦克风采集通过独立语音 TCP Socket 发送给房主
     - 从房主接收混合音频并通过独立播放线程播放
     """
 
@@ -42,6 +42,8 @@ class GuestAudio:
         self._input_stream: Optional[pyaudio.Stream] = None
         self._output_stream: Optional[pyaudio.Stream] = None
         self._send_thread: Optional[threading.Thread] = None
+        self._voice_send_thread: Optional[threading.Thread] = None
+        self._voice_send_queue: queue.Queue = queue.Queue(maxsize=5)  # 极小有界队列，满时丢旧包
         self._play_thread: Optional[threading.Thread] = None
         self._play_queue: queue.Queue = queue.Queue(maxsize=50)
         self._mic_on = False
@@ -114,7 +116,13 @@ class GuestAudio:
                 )
             self._mic_on = True
 
-            # 启动发送线程
+            # 启动网络发送线程（独立于采集，避免 sendall 阻塞拖慢采集）
+            self._voice_send_thread = threading.Thread(
+                target=self._voice_net_send_loop, daemon=True, name="GuestVoiceNetSend"
+            )
+            self._voice_send_thread.start()
+
+            # 启动采集线程
             self._send_thread = threading.Thread(
                 target=self._send_loop, daemon=True, name="GuestAudioSend"
             )
@@ -137,9 +145,15 @@ class GuestAudio:
             except Exception:
                 pass
             self._input_stream = None
+        # 停止采集线程
         if self._send_thread:
             self._send_thread.join(timeout=2)
             self._send_thread = None
+        # 停止网络发送线程
+        self._voice_send_queue.put(None)  # 哨兵
+        if self._voice_send_thread:
+            self._voice_send_thread.join(timeout=2)
+            self._voice_send_thread = None
         log.log(TAG, "Mic stopped (output still active)")
 
     def stop(self) -> None:
@@ -167,8 +181,14 @@ class GuestAudio:
             self._pa.terminate()
             self._pa = None
 
+        # 停止采集线程
         if self._send_thread:
             self._send_thread.join(timeout=2)
+        # 停止网络发送线程
+        self._voice_send_queue.put(None)
+        if self._voice_send_thread:
+            self._voice_send_thread.join(timeout=2)
+        # 停止播放线程
         if self._play_thread:
             self._play_thread.join(timeout=2)
 
@@ -186,26 +206,54 @@ class GuestAudio:
     # ═════════════════════════════════════════
 
     def _send_loop(self) -> None:
-        log.log(TAG, "Send loop started (Voice TCP)")
+        """采集循环：从麦克风读取音频 → 放入有界发送队列（非阻塞，满则丢旧包）。"""
+        log.log(TAG, "Capture loop started (Voice TCP)")
         count = 0
         while self._running and self._mic_on:
             try:
                 pcm_data = self._input_stream.read(
                     config.AUDIO_CHUNK, exception_on_overflow=False
                 )
-                # 通过独立语音 TCP Socket 发送语音帧
                 if self._voice_sock:
                     frame = build_frame(MSG_VOICE, self._client_id, HOST_ID, pcm_data)
-                    self._voice_sock.sendall(frame)
+                    # 非阻塞入队：队列满时丢弃最旧包，确保采集不阻塞
+                    if self._voice_send_queue.full():
+                        try:
+                            self._voice_send_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                    try:
+                        self._voice_send_queue.put_nowait(frame)
+                    except queue.Full:
+                        pass
                 count += 1
                 if count % 50 == 1:
                     rms = np.sqrt(np.mean(np.frombuffer(pcm_data, dtype=np.int16).astype(np.float64) ** 2))
-                    log.log(TAG, f"[SEND] pkt#{count} rms={rms:.0f}")
+                    log.log(TAG, f"[CAPTURE] pkt#{count} rms={rms:.0f} qsize={self._voice_send_queue.qsize()}")
             except Exception as e:
                 if self._running and self._mic_on:
-                    log.error(TAG, f"Audio send error: {e}")
+                    log.error(TAG, f"Audio capture error: {e}")
                 break
-        log.log(TAG, f"Send loop stopped (total={count})")
+        log.log(TAG, f"Capture loop stopped (total={count})")
+
+    def _voice_net_send_loop(self) -> None:
+        """网络发送线程：从有界队列取帧 → sendall（阻塞仅影响此线程，不拖慢采集）。"""
+        log.log(TAG, "Voice net send loop started")
+        count = 0
+        while self._running:
+            try:
+                frame = self._voice_send_queue.get(timeout=0.5)
+                if frame is None:  # 哨兵值
+                    break
+                if self._voice_sock:
+                    self._voice_sock.sendall(frame)
+                count += 1
+            except queue.Empty:
+                continue
+            except (ConnectionError, OSError) as e:
+                log.error(TAG, f"Voice net send error: {e}")
+                break
+        log.log(TAG, f"Voice net send loop stopped (total={count})")
 
     # ═════════════════════════════════════════
     # 播放循环（独立线程，不阻塞 Qt 主线程）

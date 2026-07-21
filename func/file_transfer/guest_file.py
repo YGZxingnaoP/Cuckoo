@@ -58,6 +58,7 @@ class GuestFileReceiver(QObject):
         self._save_dir = save_dir or config.DOWNLOAD_DIR
         os.makedirs(self._save_dir, exist_ok=True)
         self._transfers: dict[int, IncomingTransfer] = {}  # sender_id -> transfer
+        self._files_opened: set[int] = set()  # 已写入首块的 sender_id（避免跨线程竞争）
         self._start_times: dict[int, float] = {}
         self._last_reports: dict[int, float] = {}
         self._last_bytes_map: dict[int, int] = {}
@@ -138,6 +139,7 @@ class GuestFileReceiver(QObject):
                 self.status_changed.emit(f"接收完成: {display}")
                 log.log(TAG, f"File saved: {final_path}")
                 del self._transfers[task.sender_id]
+                self._files_opened.discard(task.sender_id)
                 self._start_times.pop(task.sender_id, None)
                 self._last_reports.pop(task.sender_id, None)
                 self._last_bytes_map.pop(task.sender_id, None)
@@ -146,6 +148,7 @@ class GuestFileReceiver(QObject):
             log.error(TAG, f"File write error: {e}")
             self.status_changed.emit(f"写入失败: {e}")
             self._transfers.pop(task.sender_id, None)
+            self._files_opened.discard(task.sender_id)
             self._start_times.pop(task.sender_id, None)
             self._last_reports.pop(task.sender_id, None)
             self._last_bytes_map.pop(task.sender_id, None)
@@ -185,7 +188,9 @@ class GuestFileReceiver(QObject):
         if transfer is None:
             return
 
-        is_first = (transfer.received == 0)
+        # 用 _files_opened 集合判断是否首块，避免读取被写入线程修改的 received 字段
+        is_first = sender_id not in self._files_opened
+        self._files_opened.add(sender_id)
         task = _WriteTask(
             sender_id=sender_id,
             payload=payload,
@@ -267,6 +272,7 @@ class GuestFileReceiver(QObject):
             except OSError:
                 pass
         self._transfers.clear()
+        self._files_opened.clear()
         self._start_times.clear()
         self._last_reports.clear()
         self._last_bytes_map.clear()

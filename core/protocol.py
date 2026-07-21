@@ -2,7 +2,6 @@
 """
 统一通信协议
 TCP 帧格式: [4字节总长度][1字节消息类型][4字节发送者ID][4字节目标ID][N字节数据体]
-UDP 语音帧: [2字节发送者ID][2字节序列号][N字节PCM数据]
 """
 
 import struct
@@ -86,30 +85,6 @@ def read_frame(recv_exact) -> Optional[tuple[int, int, int, bytes]]:
         return msg_type, sender_id, target_id, payload
     except (ConnectionError, OSError, struct.error):
         return None
-
-
-# ─────────────────────────────────────────────
-# UDP 语音帧
-# ─────────────────────────────────────────────
-VOICE_HEADER_SIZE: int = 4  # 2B sender_id + 2B seq
-_VOICE_HEADER_FORMAT: str = "!HH"
-
-
-def build_voice_packet(sender_id: int, seq: int, pcm_data: bytes) -> bytes:
-    """构建 UDP 语音帧。"""
-    header = struct.pack(_VOICE_HEADER_FORMAT, sender_id, seq)
-    return header + pcm_data
-
-
-def parse_voice_packet(data: bytes) -> Optional[tuple[int, int, bytes]]:
-    """
-    解析 UDP 语音帧。
-    :return: (sender_id, seq, pcm_data) 或 None
-    """
-    if len(data) < VOICE_HEADER_SIZE:
-        return None
-    sender_id, seq = struct.unpack(_VOICE_HEADER_FORMAT, data[:VOICE_HEADER_SIZE])
-    return sender_id, seq, data[VOICE_HEADER_SIZE:]
 
 
 # ─────────────────────────────────────────────

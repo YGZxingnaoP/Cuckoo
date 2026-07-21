@@ -53,7 +53,7 @@ class ClientConnection(QObject):
         self._my_id: int = -1
         self._sock: Optional[socket.socket] = None
         self._running = False
-        self._send_queue: queue.Queue = queue.Queue()
+        self._send_queue: queue.Queue = queue.Queue(maxsize=config.SEND_QUEUE_MAX * 3)  # 有界队列，防止内存无限增长
         self._receiver_thread: Optional[threading.Thread] = None
         self._sender_thread: Optional[threading.Thread] = None
         self._disconnected_emitted = False  # 防止重复发射断开信号

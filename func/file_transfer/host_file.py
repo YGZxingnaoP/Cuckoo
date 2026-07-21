@@ -67,6 +67,7 @@ class HostFileHandler(QObject):
         os.makedirs(self._save_dir, exist_ok=True)
         self._transfers: dict[int, IncomingTransfer] = {}  # sender_id -> transfer
         self._transfers_lock = threading.Lock()  # 保护并发访问
+        self._files_opened: set[int] = set()  # 已写入首块的 sender_id（避免跨线程竞争）
 
         # 异步写入队列与线程
         self._write_queue: queue.Queue = queue.Queue()
@@ -139,12 +140,14 @@ class HostFileHandler(QObject):
                 log.log(TAG, f"File saved: {final_path}")
                 with self._transfers_lock:
                     self._transfers.pop(task.sender_id, None)
+                    self._files_opened.discard(task.sender_id)
 
         except OSError as e:
             log.error(TAG, f"File write error: {e}")
             self.status_changed.emit(f"写入失败: {e}")
             with self._transfers_lock:
                 self._transfers.pop(task.sender_id, None)
+                self._files_opened.discard(task.sender_id)
 
     # ═════════════════════════════════════════
     # 接收文件元数据
@@ -176,6 +179,7 @@ class HostFileHandler(QObject):
             )
             with self._transfers_lock:
                 self._transfers[sender_id] = transfer
+                self._files_opened.discard(sender_id)  # 新文件重置状态
             display = f"{base_name}/{filename}" if base_name else filename
             self.status_changed.emit(f"正在接收: {display} (来自用户{sender_id})")
         else:
@@ -200,7 +204,10 @@ class HostFileHandler(QObject):
             return
 
         # 本地接收：异步入队，不阻塞 Server 接收线程
-        is_first = (transfer.received == 0)
+        # 用 _files_opened 集合判断是否首块，避免读取被写入线程修改的 received 字段
+        with self._transfers_lock:
+            is_first = sender_id not in self._files_opened
+            self._files_opened.add(sender_id)
         task = _WriteTask(
             sender_id=sender_id,
             payload=payload,
@@ -429,6 +436,7 @@ class HostFileHandler(QObject):
         with self._transfers_lock:
             transfers_snapshot = list(self._transfers.values())
             self._transfers.clear()
+            self._files_opened.clear()
         for transfer in transfers_snapshot:
             try:
                 if os.path.exists(transfer.file_path):

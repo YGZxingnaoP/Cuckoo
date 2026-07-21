@@ -28,7 +28,7 @@ class AudioMixer:
     """
     主机端集中混音器（MCU）。
     - 接收所有音频（由 main_window 通过 push_client_audio 推送）
-    - 每 20ms 混合所有音源
+    - 每 64ms 混合所有音源
     - 通过 send_callback 将混合音频发给房客
     """
 
@@ -151,7 +151,7 @@ class AudioMixer:
     # ═════════════════════════════════════════
 
     def _mix_loop(self) -> None:
-        """混音线程：每 60ms 混合所有音源并发送（排除各客户端自身音频）。"""
+        """混音线程：每 64ms 混合所有音源并发送（排除各客户端自身音频）。"""
         log.log(TAG, "Mix loop started")
         count = 0
         while self._running:
