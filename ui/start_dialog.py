@@ -94,9 +94,14 @@ class StartDialog(QDialog):
         self._btn_radmin = QPushButton("启动 Radmin VPN")
         self._btn_radmin.setObjectName("btnRadmin")
         self._btn_radmin.clicked.connect(self._on_launch_radmin)
+        self._btn_install_radmin = QPushButton("安装 Radmin")
+        self._btn_install_radmin.setObjectName("btnInstallRadmin")
+        self._btn_install_radmin.setVisible(False)
+        self._btn_install_radmin.clicked.connect(self._on_install_radmin)
         self._radmin_hint = QLabel("")
         self._radmin_hint.setStyleSheet("color: #999; font-size: 11px;")
         radmin_layout.addWidget(self._btn_radmin)
+        radmin_layout.addWidget(self._btn_install_radmin)
         radmin_layout.addWidget(self._radmin_hint, stretch=1)
         layout.addLayout(radmin_layout)
 
@@ -114,7 +119,7 @@ class StartDialog(QDialog):
     # ─────────────────────────────────────────
 
     def _on_launch_radmin(self) -> None:
-        """尝试启动 Radmin VPN，找不到则非阻塞提示。"""
+        """尝试启动 Radmin VPN，找不到则显示安装按钮。"""
         exe = self._find_radmin()
         if exe:
             try:
@@ -125,8 +130,28 @@ class StartDialog(QDialog):
                 self._radmin_hint.setText(f"启动失败: {e}")
                 self._radmin_hint.setStyleSheet("color: #c44; font-size: 11px;")
         else:
-            self._radmin_hint.setText("未找到 Radmin VPN，请手动启动")
+            self._radmin_hint.setText("未找到 Radmin VPN")
             self._radmin_hint.setStyleSheet("color: #c44; font-size: 11px;")
+            self._btn_install_radmin.setVisible(True)
+
+    def _on_install_radmin(self) -> None:
+        """安装 Radmin VPN（运行项目内置安装包）。"""
+        installer = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "Radmin", "Radmin_LAN_2.0.4899.9.exe"
+        )
+        if os.path.isfile(installer):
+            try:
+                os.startfile(installer)
+                self._radmin_hint.setText("安装程序已启动")
+                self._radmin_hint.setStyleSheet("color: #4a4; font-size: 11px;")
+                self._btn_install_radmin.setVisible(False)
+            except OSError as e:
+                self._radmin_hint.setText(f"安装失败: {e}")
+                self._radmin_hint.setStyleSheet("color: #c44; font-size: 11px;")
+        else:
+            QMessageBox.warning(self, "未找到安装包",
+                                f"未找到安装程序：\n{installer}\n请手动下载 Radmin VPN。")
 
     @staticmethod
     def _find_radmin() -> str:

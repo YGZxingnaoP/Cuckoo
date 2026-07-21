@@ -41,6 +41,9 @@ BROADCAST_ID: int = 0xFFFF     # 广播（全体）
 TCP_HEADER_SIZE: int = 13
 _TCP_HEADER_FORMAT: str = "!IBII"  # 大端序
 
+# 单帧最大允许大小（16 MB）—— 防止恶意客户端发送超大长度导致内存耗尽
+MAX_FRAME_SIZE: int = 16 * 1024 * 1024
+
 
 def build_frame(msg_type: int, sender_id: int, target_id: int, data: bytes = b"") -> bytes:
     """
@@ -72,6 +75,11 @@ def read_frame(recv_exact) -> Optional[tuple[int, int, int, bytes]]:
     try:
         length_bytes = recv_exact(4)
         length = struct.unpack("!I", length_bytes)[0]
+        # 安全检查：拒绝超大帧，防止内存耗尽攻击
+        if length > MAX_FRAME_SIZE:
+            raise ConnectionError(
+                f"Frame too large: {length} bytes (max {MAX_FRAME_SIZE})"
+            )
         body = recv_exact(length)
         msg_type, sender_id, target_id = parse_frame_header(body)
         payload = body[9:]

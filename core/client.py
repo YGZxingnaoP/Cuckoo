@@ -56,6 +56,7 @@ class ClientConnection(QObject):
         self._send_queue: queue.Queue = queue.Queue()
         self._receiver_thread: Optional[threading.Thread] = None
         self._sender_thread: Optional[threading.Thread] = None
+        self._disconnected_emitted = False  # 防止重复发射断开信号
 
     # ═════════════════════════════════════════
     # 公开属性
@@ -80,6 +81,7 @@ class ClientConnection(QObject):
         self._sock.connect((self._host_ip, config.TCP_PORT))
         self._sock.settimeout(None)
         self._running = True
+        self._disconnected_emitted = False
         log.log(TAG, f"Connected to host at {self._host_ip}:{config.TCP_PORT}")
 
         # 启动发送线程
@@ -148,7 +150,9 @@ class ClientConnection(QObject):
 
         except (ConnectionError, OSError) as e:
             log.error(TAG, f"Connection lost: {e}")
-            self.disconnected.emit()
+            if not self._disconnected_emitted:
+                self._disconnected_emitted = True
+                self.disconnected.emit()
         finally:
             log.log(TAG, "Receiver thread stopped")
 

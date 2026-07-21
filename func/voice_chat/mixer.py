@@ -59,6 +59,10 @@ class AudioMixer:
         self._playback_pa: Optional[pyaudio.PyAudio] = None
         self._playback_stream: Optional[pyaudio.Stream] = None
 
+        # 音量增益
+        self._volume_gain: float = 1.0
+        self._gain_lock = threading.Lock()
+
     # ═════════════════════════════════════════
     # 客户端管理
     # ═════════════════════════════════════════
@@ -80,6 +84,12 @@ class AudioMixer:
     def set_send_callback(self, cb: Callable[[int, bytes], None]) -> None:
         """设置发送回调。"""
         self._send_callback = cb
+
+    def set_volume_gain(self, gain_percent: int) -> None:
+        """设置主机回放音量增益（百分比，100=原始）。"""
+        with self._gain_lock:
+            self._volume_gain = gain_percent / 100.0
+        log.log(TAG, f"Host volume gain set to {gain_percent}% ({gain_percent / 100.0:.2f}x)")
 
     # ═════════════════════════════════════════
     # 启动与停止
@@ -261,6 +271,16 @@ class AudioMixer:
             self._playback_buffer.clear()
         log.log(TAG, "Host playback stopped")
 
+    def _apply_gain(self, pcm_data: bytes) -> bytes:
+        """对 PCM 数据应用音量增益。"""
+        with self._gain_lock:
+            gain = self._volume_gain
+        if abs(gain - 1.0) < 0.01:
+            return pcm_data
+        samples = np.frombuffer(pcm_data, dtype=np.int16).astype(np.int32)
+        samples = (samples * gain).clip(-32768, 32767).astype(np.int16)
+        return samples.tobytes()
+
     def _playback_loop(self) -> None:
         """主机回放线程：从缓冲区播放混合音频到扬声器。"""
         log.log(TAG, "Playback loop started")
@@ -274,6 +294,7 @@ class AudioMixer:
                 continue
             try:
                 if self._playback_stream:
+                    chunk = self._apply_gain(chunk)
                     self._playback_stream.write(chunk)
             except Exception as e:
                 if self._running:

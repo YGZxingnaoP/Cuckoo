@@ -10,6 +10,7 @@ import queue
 import threading
 from typing import Optional
 
+import numpy as np
 import pyaudio
 
 from common import logger as log
@@ -40,6 +41,8 @@ class GuestAudio:
         self._play_thread: Optional[threading.Thread] = None
         self._play_queue: queue.Queue = queue.Queue(maxsize=50)
         self._mic_on = False
+        self._volume_gain: float = 1.0  # 音量增益倍率 (1.0 = 原始)
+        self._gain_lock = threading.Lock()
 
     @property
     def mic_on(self) -> bool:
@@ -47,6 +50,12 @@ class GuestAudio:
 
     def set_client_id(self, cid: int) -> None:
         self._client_id = cid
+
+    def set_volume_gain(self, gain_percent: int) -> None:
+        """设置音量增益（百分比，100=原始）。"""
+        with self._gain_lock:
+            self._volume_gain = gain_percent / 100.0
+        log.log(TAG, f"Volume gain set to {gain_percent}% ({gain_percent / 100.0:.2f}x)")
 
     # ═════════════════════════════════════════
     # 扬声器输出（加入房间后即可打开，无需开麦）
@@ -184,7 +193,6 @@ class GuestAudio:
                 self._client_conn.send_frame(0x06, 0, pcm_data)  # MSG_VOICE=0x06, target=HOST
                 count += 1
                 if count % 50 == 1:
-                    import numpy as np
                     rms = np.sqrt(np.mean(np.frombuffer(pcm_data, dtype=np.int16).astype(np.float64) ** 2))
                     log.log(TAG, f"[SEND] pkt#{count} rms={rms:.0f}")
             except Exception as e:
@@ -197,6 +205,16 @@ class GuestAudio:
     # 播放循环（独立线程，不阻塞 Qt 主线程）
     # ═════════════════════════════════════════
 
+    def _apply_gain(self, pcm_data: bytes) -> bytes:
+        """对 PCM 数据应用音量增益。"""
+        with self._gain_lock:
+            gain = self._volume_gain
+        if abs(gain - 1.0) < 0.01:
+            return pcm_data
+        samples = np.frombuffer(pcm_data, dtype=np.int16).astype(np.int32)
+        samples = (samples * gain).clip(-32768, 32767).astype(np.int16)
+        return samples.tobytes()
+
     def _play_loop(self) -> None:
         """播放线程：从队列取音频数据写入扬声器。"""
         log.log(TAG, "Playback loop started")
@@ -207,10 +225,10 @@ class GuestAudio:
                 if pcm_data is None:
                     break
                 if self._output_stream:
+                    pcm_data = self._apply_gain(pcm_data)
                     self._output_stream.write(pcm_data)
                 count += 1
                 if count % 50 == 1:
-                    import numpy as np
                     rms = np.sqrt(np.mean(np.frombuffer(pcm_data, dtype=np.int16).astype(np.float64) ** 2))
                     log.log(TAG, f"[PLAY] pkt#{count} rms={rms:.0f}")
             except queue.Empty:

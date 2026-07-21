@@ -46,10 +46,10 @@ class GuestFileReceiver(QObject):
         super().__init__()
         self._save_dir = save_dir or config.DOWNLOAD_DIR
         os.makedirs(self._save_dir, exist_ok=True)
-        self._transfer: Optional[IncomingTransfer] = None
-        self._start_time: float = 0
-        self._last_report: float = 0
-        self._last_bytes: int = 0
+        self._transfers: dict[int, IncomingTransfer] = {}  # sender_id -> transfer
+        self._start_times: dict[int, float] = {}
+        self._last_reports: dict[int, float] = {}
+        self._last_bytes_map: dict[int, int] = {}
 
     def handle_file_meta(self, sender_id: int, payload: bytes) -> None:
         """处理文件元数据帧。"""
@@ -58,7 +58,7 @@ class GuestFileReceiver(QObject):
             return
 
         base_name, filename, file_size, _target_id = meta
-        log.log(TAG, f"File meta: [{base_name}] {filename} ({file_size} bytes)")
+        log.log(TAG, f"File meta from {sender_id}: [{base_name}] {filename} ({file_size} bytes)")
 
         if base_name:
             # 文件夹：save_dir/base_name/relative_path
@@ -68,64 +68,73 @@ class GuestFileReceiver(QObject):
         else:
             part_path = os.path.join(self._save_dir, filename + ".part")
 
-        self._transfer = IncomingTransfer(
+        self._transfers[sender_id] = IncomingTransfer(
             filename=filename, file_size=file_size,
             base_name=base_name, file_path=part_path
         )
-        self._start_time = time.time()
-        self._last_report = self._start_time
-        self._last_bytes = 0
+        now = time.time()
+        self._start_times[sender_id] = now
+        self._last_reports[sender_id] = now
+        self._last_bytes_map[sender_id] = 0
 
         display = f"{base_name}/{filename}" if base_name else filename
         self.status_changed.emit(f"正在接收: {display}")
 
     def handle_file_chunk(self, sender_id: int, payload: bytes) -> None:
         """处理文件数据块帧。"""
-        if self._transfer is None:
+        transfer = self._transfers.get(sender_id)
+        if transfer is None:
             return
 
         # 确保父目录存在
-        os.makedirs(os.path.dirname(self._transfer.file_path), exist_ok=True)
+        os.makedirs(os.path.dirname(transfer.file_path), exist_ok=True)
 
         try:
-            with open(self._transfer.file_path, "ab" if self._transfer.received > 0 else "wb") as f:
+            with open(transfer.file_path, "ab" if transfer.received > 0 else "wb") as f:
                 f.write(payload)
-            self._transfer.received += len(payload)
+            transfer.received += len(payload)
 
             # 进度更新
-            t = self._transfer
-            if t.file_size > 0:
-                percent = min(100, int(t.received * 100 / t.file_size))
+            if transfer.file_size > 0:
+                percent = min(100, int(transfer.received * 100 / transfer.file_size))
                 now = time.time()
-                if now - self._last_report >= 1.0 or percent >= 100:
-                    elapsed = now - self._last_report
-                    speed = (t.received - self._last_bytes) / elapsed if elapsed > 0 else 0
+                last_report = self._last_reports.get(sender_id, now)
+                if now - last_report >= 1.0 or percent >= 100:
+                    elapsed = now - last_report
+                    last_b = self._last_bytes_map.get(sender_id, 0)
+                    speed = (transfer.received - last_b) / elapsed if elapsed > 0 else 0
                     speed_str = self._format_speed(speed)
-                    remaining = t.file_size - t.received
+                    remaining = transfer.file_size - transfer.received
                     eta = remaining / speed if speed > 0 else 0
                     eta_str = self._format_eta(eta)
                     self.progress.emit(percent, speed_str, eta_str)
-                    self._last_report = now
-                    self._last_bytes = t.received
+                    self._last_reports[sender_id] = now
+                    self._last_bytes_map[sender_id] = transfer.received
 
             # 完成检测
-            if t.received >= t.file_size:
-                if t.base_name:
-                    final_path = os.path.join(self._save_dir, t.base_name, t.filename)
+            if transfer.received >= transfer.file_size:
+                if transfer.base_name:
+                    final_path = os.path.join(self._save_dir, transfer.base_name, transfer.filename)
                 else:
-                    final_path = os.path.join(self._save_dir, t.filename)
+                    final_path = os.path.join(self._save_dir, transfer.filename)
                 final_path = self._unique_path(final_path)
-                os.rename(t.file_path, final_path)
+                os.rename(transfer.file_path, final_path)
                 self.file_complete.emit(final_path)
-                display = f"{t.base_name}/{t.filename}" if t.base_name else t.filename
+                display = f"{transfer.base_name}/{transfer.filename}" if transfer.base_name else transfer.filename
                 self.status_changed.emit(f"接收完成: {display}")
                 log.log(TAG, f"File saved: {final_path}")
-                self._transfer = None
+                del self._transfers[sender_id]
+                self._start_times.pop(sender_id, None)
+                self._last_reports.pop(sender_id, None)
+                self._last_bytes_map.pop(sender_id, None)
 
         except OSError as e:
             log.error(TAG, f"File write error: {e}")
             self.status_changed.emit(f"写入失败: {e}")
-            self._transfer = None
+            self._transfers.pop(sender_id, None)
+            self._start_times.pop(sender_id, None)
+            self._last_reports.pop(sender_id, None)
+            self._last_bytes_map.pop(sender_id, None)
 
     @staticmethod
     def _parse_meta(payload: bytes) -> Optional[tuple[str, str, int, int]]:
@@ -188,9 +197,13 @@ class GuestFileReceiver(QObject):
 
     def cleanup(self) -> None:
         """清理未完成的 .part 文件。"""
-        if self._transfer and os.path.exists(self._transfer.file_path):
+        for transfer in self._transfers.values():
             try:
-                os.remove(self._transfer.file_path)
+                if os.path.exists(transfer.file_path):
+                    os.remove(transfer.file_path)
             except OSError:
                 pass
-        self._transfer = None
+        self._transfers.clear()
+        self._start_times.clear()
+        self._last_reports.clear()
+        self._last_bytes_map.clear()

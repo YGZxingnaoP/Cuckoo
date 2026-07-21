@@ -57,6 +57,7 @@ class HostFileHandler(QObject):
         self._save_dir = save_dir or config.DOWNLOAD_DIR
         os.makedirs(self._save_dir, exist_ok=True)
         self._transfers: dict[int, IncomingTransfer] = {}  # sender_id -> transfer
+        self._transfers_lock = threading.Lock()  # 保护并发访问
 
         # 注册消息处理器
         server.register_handler(MSG_FILE_META, self._handle_meta)
@@ -90,7 +91,8 @@ class HostFileHandler(QObject):
                 sender_id=sender_id, target_id=HOST_ID,
                 file_path=part_path, base_name=base_name
             )
-            self._transfers[sender_id] = transfer
+            with self._transfers_lock:
+                self._transfers[sender_id] = transfer
             display = f"{base_name}/{filename}" if base_name else filename
             self.status_changed.emit(f"正在接收: {display} (来自用户{sender_id})")
         else:
@@ -105,7 +107,8 @@ class HostFileHandler(QObject):
 
     def _handle_chunk(self, msg_type: int, sender_id: int, target_id: int, payload: bytes) -> None:
         """处理文件数据块帧。"""
-        transfer = self._transfers.get(sender_id)
+        with self._transfers_lock:
+            transfer = self._transfers.get(sender_id)
         if transfer is None:
             # 可能是中转
             if target_id != HOST_ID and target_id != BROADCAST_ID:
@@ -140,12 +143,14 @@ class HostFileHandler(QObject):
                 display = f"{transfer.base_name}/{transfer.filename}" if transfer.base_name else transfer.filename
                 self.status_changed.emit(f"接收完成: {display}")
                 log.log(TAG, f"File saved: {final_path}")
-                del self._transfers[sender_id]
+                with self._transfers_lock:
+                    self._transfers.pop(sender_id, None)
 
         except OSError as e:
             log.error(TAG, f"File write error: {e}")
             self.status_changed.emit(f"写入失败: {e}")
-            del self._transfers[sender_id]
+            with self._transfers_lock:
+                self._transfers.pop(sender_id, None)
 
     # ═════════════════════════════════════════
     # 主机发送文件
@@ -350,10 +355,12 @@ class HostFileHandler(QObject):
 
     def cleanup(self) -> None:
         """清理未完成的 .part 文件。"""
-        for transfer in self._transfers.values():
+        with self._transfers_lock:
+            transfers_snapshot = list(self._transfers.values())
+            self._transfers.clear()
+        for transfer in transfers_snapshot:
             try:
                 if os.path.exists(transfer.file_path):
                     os.remove(transfer.file_path)
             except OSError:
                 pass
-        self._transfers.clear()

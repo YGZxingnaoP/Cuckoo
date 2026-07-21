@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QMessageBox, QStatusBar, QHBoxLayout, QWidget
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QPixmap
 
 import config
 from common import logger as log
@@ -39,6 +38,7 @@ from ui.tabs.screen_tab import ScreenTab
 from ui.tabs.voice_tab import VoiceTab
 from ui.tabs.file_tab import FileTab
 from ui.tabs.chat_tab import ChatTab
+from ui.online_panel import OnlineListPanel
 
 # 功能模块
 from func.screen_share.host import ScreenHost
@@ -66,6 +66,10 @@ class MainWindow(QMainWindow):
     _send_progress = Signal(int, str, str)
     _client_event = Signal(str)  # 房客加入/离开事件文本
     _targets_changed = Signal(list)  # 房客加入/离开时更新目标列表
+    _online_users_changed = Signal(dict)  # 在线用户列表变更 {uid: nickname}
+
+    # 房主断开连接信号（房客端专用）
+    host_disconnected = Signal()
 
     def __init__(self, is_host: bool, peer_ip: str = "", nickname: str = ""):
         super().__init__()
@@ -97,6 +101,7 @@ class MainWindow(QMainWindow):
 
         self._init_ui()
         self._start_services()
+        self._update_online_panel()
 
     # ═════════════════════════════════════════
     # UI 构建
@@ -129,7 +134,11 @@ class MainWindow(QMainWindow):
         self._chat_tab = ChatTab()
         self._tabs.addTab(self._chat_tab, "文字")
 
-        main_layout.addWidget(self._tabs)
+        # 在线列表面板（侧边栏）
+        self._online_panel = OnlineListPanel(is_host=self._is_host)
+
+        main_layout.addWidget(self._online_panel)
+        main_layout.addWidget(self._tabs, stretch=1)
         self.setCentralWidget(central)
 
         # ── 状态栏 ──
@@ -158,6 +167,10 @@ class MainWindow(QMainWindow):
         self._send_progress.connect(self._file_tab.update_progress)
         self._client_event.connect(self._on_client_event_ui)
         self._targets_changed.connect(self._on_targets_changed_ui)
+        self._online_users_changed.connect(self._online_panel.update_users)
+
+        # 音量增益信号
+        self._voice_tab.volume_gain_changed.connect(self._on_volume_gain_changed)
 
     # ═════════════════════════════════════════
     # 服务启动
@@ -222,6 +235,7 @@ class MainWindow(QMainWindow):
         self._nicknames.set(uid, nickname)
         targets = {u: info.nickname or f"房客{u}" for u, info in self._server.clients.items()}
         self._targets_changed.emit(list(targets.items()))
+        self._online_users_changed.emit(self._nicknames.get_all())
         self._client_event.emit(f"{nickname} 加入了房间")
 
     def _on_client_left(self, uid: int, nickname: str) -> None:
@@ -231,6 +245,7 @@ class MainWindow(QMainWindow):
             self._audio_mixer.unregister_client(uid)
         targets = {u: info.nickname or f"房客{u}" for u, info in self._server.clients.items()} if self._server else {}
         self._targets_changed.emit(list(targets.items()))
+        self._online_users_changed.emit(self._nicknames.get_all())
         self._client_event.emit(f"{nickname} 离开了房间")
 
     def _on_client_event_ui(self, text: str) -> None:
@@ -302,12 +317,14 @@ class MainWindow(QMainWindow):
         users = dict(users_list)
         for uid, nick in users.items():
             self._nicknames.set(uid, nick)
+        self._online_users_changed.emit(self._nicknames.get_all())
         self._update_guest_file_targets(users)
 
     def _on_user_joined(self, uid: int, nickname: str) -> None:
         """新用户加入通知。"""
         self._nicknames.set(uid, nickname)
         self._chat_tab.append_system(f"{nickname} 加入了房间")
+        self._online_users_changed.emit(self._nicknames.get_all())
         # 更新目标列表
         all_users = self._nicknames.get_all()
         all_users.pop(self._my_id, None)
@@ -317,6 +334,7 @@ class MainWindow(QMainWindow):
         """用户离开通知。"""
         self._nicknames.remove(uid)
         self._chat_tab.append_system(f"{nickname} 离开了房间")
+        self._online_users_changed.emit(self._nicknames.get_all())
         all_users = self._nicknames.get_all()
         all_users.pop(self._my_id, None)
         self._file_tab.update_targets(all_users)
@@ -327,10 +345,12 @@ class MainWindow(QMainWindow):
         self._file_tab.update_targets(targets)
 
     def _on_disconnected(self) -> None:
-        """连接断开。"""
+        """连接断开——房客跳回启动界面。"""
         self._status_bar.showMessage("与房主断开连接")
         self._screen_tab.stop_streaming()
-        QMessageBox.warning(self, "连接断开", "与房主的连接已断开。")
+        QMessageBox.warning(self, "连接断开", "与房主的连接已断开，将返回启动界面。")
+        self.host_disconnected.emit()
+        self.close()
 
     # ═════════════════════════════════════════
     # 帧处理（房客端）
@@ -442,8 +462,7 @@ class MainWindow(QMainWindow):
         if self._host_mic_running:
             self._host_mic_running = False
             self._voice_tab.set_mic_off()
-            if self._host_mic_thread:
-                self._host_mic_thread.join(timeout=3)
+            # 不 join——让采集线程自然退出，避免阻塞 UI
             log.log(TAG, "Host mic off")
         else:
             if not self._audio_mixer:
@@ -647,6 +666,17 @@ class MainWindow(QMainWindow):
             self._status_bar.showMessage("房主在线")
         else:
             self._status_bar.showMessage("房主离线")
+
+    def _on_volume_gain_changed(self, gain_percent: int) -> None:
+        """音量增益变更处理。"""
+        if self._guest_audio:
+            self._guest_audio.set_volume_gain(gain_percent)
+        if self._audio_mixer:
+            self._audio_mixer.set_volume_gain(gain_percent)
+
+    def _update_online_panel(self) -> None:
+        """刷新在线列表面板。"""
+        self._online_panel.update_users(self._nicknames.get_all())
 
     # ═════════════════════════════════════════
     # 窗口关闭
