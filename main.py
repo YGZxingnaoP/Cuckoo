@@ -52,6 +52,11 @@ QComboBox QAbstractItemView {
 }
 QRadioButton { spacing: 8px; color: #cdd6f4; }
 QRadioButton::indicator { width: 16px; height: 16px; }
+
+QTabWidget#mainTabs::tab-bar {
+    left: 30px; 
+}
+
 QTabWidget::pane { border: 1px solid #45475a; border-radius: 6px; background-color: #1e1e2e; }
 QTabBar::tab {
     background-color: #313244; border: 1px solid #45475a; border-bottom: none;

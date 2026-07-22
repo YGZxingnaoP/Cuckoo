@@ -106,7 +106,6 @@ class Server:
         while self._running:
             try:
                 client_sock, addr = self._server_sock.accept()
-                # 开启 TCP_NODELAY 禁用 Nagle 算法，降低延迟
                 client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 client_sock.settimeout(None)
             except socket.timeout: continue
@@ -227,23 +226,37 @@ class Server:
         while self._running:
             frame_bytes = None
             try:
-                try: frame_bytes = info.priority_queue.get_nowait()
-                except queue.Empty: pass
+                # 1. 最高优先级：信令/控制消息
+                try:
+                    frame_bytes = info.priority_queue.get_nowait()
+                except queue.Empty:
+                    pass
 
+                # 2. 次高优先级：文件块 (防止被投屏饿死)
                 if frame_bytes is None:
                     try:
-                        while True: frame_bytes = info.media_queue.get_nowait()
-                    except queue.Empty: pass
+                        frame_bytes = info.file_queue.get_nowait()
+                    except queue.Empty:
+                        pass
 
+                # 3. 最低优先级：投屏帧 (丢弃旧帧)
                 if frame_bytes is None:
-                    try: frame_bytes = info.file_queue.get_nowait()
-                    except queue.Empty: pass
+                    try:
+                        while True:
+                            frame_bytes = info.media_queue.get_nowait()
+                    except queue.Empty:
+                        pass
 
+                # 4. 阻塞等待信令队列
                 if frame_bytes is None:
-                    try: frame_bytes = info.priority_queue.get(timeout=0.1)
-                    except queue.Empty: continue
+                    try:
+                        frame_bytes = info.priority_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
 
-                if frame_bytes is False: break
+                if frame_bytes is False:
+                    break
+                    
                 info.sock.sendall(frame_bytes)
             except (ConnectionError, OSError) as e:
                 log.error(TAG, f"Send error for client {info.uid}: {e}")
@@ -339,9 +352,8 @@ class Server:
 
         if msg_type == MSG_SCREEN_FRAME:
             target_q, can_drop = info.media_queue, True
-        elif msg_type in (MSG_FILE_META, MSG_FILE_CHUNK, MSG_FILE_TASK_META,
-                          MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK):
-            target_q, can_drop = info.file_queue, False
+        elif msg_type == MSG_FILE_CHUNK:
+            target_q, can_drop = info.file_queue, True  
         else:
             target_q, can_drop = info.priority_queue, True
 
@@ -351,12 +363,10 @@ class Server:
                 except queue.Empty: pass
             target_q.put_nowait(frame_bytes)
         except queue.Full:
-            if not can_drop:
-                # 【致命Bug修复】：文件队列满时，绝不阻塞接收线程！直接断开该客户端连接。
-                log.warn(TAG, f"File queue full for client {uid}, closing connection to prevent deadlock.")
-                try: info.sock.close()
-                except OSError: pass
-                return
+            try: target_q.get_nowait()
+            except queue.Empty: pass
+            try: target_q.put_nowait(frame_bytes)
+            except queue.Full: pass
             
     def _remove_client(self, uid: int) -> None:
         with self._clients_lock: info = self._clients.pop(uid, None)
@@ -371,8 +381,13 @@ class Server:
             try: info.voice_sock.close()
             except OSError: pass
 
+        # 【致命Bug修复】：清空优先级队列，确保退出信号 False 能被发送线程接收到，防止线程泄漏
+        try:
+            while True: info.priority_queue.get_nowait()
+        except queue.Empty: pass
         try: info.priority_queue.put_nowait(False)
         except queue.Full: pass
+        
         try: info.voice_send_queue.put_nowait(None)
         except queue.Full: pass
 

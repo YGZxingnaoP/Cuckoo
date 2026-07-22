@@ -6,6 +6,8 @@
 
 import os
 import winreg
+import sys
+import shutil
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QRadioButton,
@@ -135,23 +137,45 @@ class StartDialog(QDialog):
             self._btn_install_radmin.setVisible(True)
 
     def _on_install_radmin(self) -> None:
-        """安装 Radmin VPN（运行项目内置安装包）。"""
-        installer = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "Radmin", "Radmin_LAN_2.0.4899.9.exe"
-        )
-        if os.path.isfile(installer):
-            try:
-                os.startfile(installer)
-                self._radmin_hint.setText("安装程序已启动")
-                self._radmin_hint.setStyleSheet("color: #4a4; font-size: 11px;")
-                self._btn_install_radmin.setVisible(False)
-            except OSError as e:
-                self._radmin_hint.setText(f"安装失败: {e}")
-                self._radmin_hint.setStyleSheet("color: #c44; font-size: 11px;")
+        """安装 Radmin VPN（从 EXE 内部安全提取并运行）。"""
+        # 1. 获取打包在 EXE 内部的安装包路径
+        if getattr(sys, 'frozen', False):
+            # PyInstaller 打包后，资源解压在 sys._MEIPASS 临时目录
+            src_installer = os.path.join(sys._MEIPASS, "Radmin", "Radmin_LAN_2.0.4899.9.exe")
         else:
-            QMessageBox.warning(self, "未找到安装包",
-                                f"未找到安装程序：\n{installer}\n请手动下载 Radmin VPN。")
+            # 开发环境，直接读取项目目录
+            src_installer = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "Radmin", "Radmin_LAN_2.0.4899.9.exe"
+            )
+
+        if not os.path.isfile(src_installer):
+            QMessageBox.warning(self, "未找到安装包", "EXE 内部未找到 Radmin 安装包，请检查打包配置。")
+            return
+
+        # 2. 确定目标提取目录 (EXE 同级目录)
+        if getattr(sys, 'frozen', False):
+            dest_dir = os.path.dirname(sys.executable)
+        else:
+            dest_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            
+        dest_installer = os.path.join(dest_dir, "Radmin_LAN_2.0.4899.9.exe")
+
+        try:
+            # 3. 从临时目录复制到 EXE 同级目录 (防止临时目录权限问题导致安装失败)
+            if os.path.exists(dest_installer):
+                os.remove(dest_installer)
+            import shutil
+            shutil.copy2(src_installer, dest_installer)
+            
+            # 4. 运行提取后的安装包
+            os.startfile(dest_installer)
+            self._radmin_hint.setText("安装程序已提取并启动")
+            self._radmin_hint.setStyleSheet("color: #4a4; font-size: 11px;")
+            self._btn_install_radmin.setVisible(False)
+        except Exception as e:
+            self._radmin_hint.setText(f"提取/运行失败: {e}")
+            self._radmin_hint.setStyleSheet("color: #c44; font-size: 11px;")
 
     @staticmethod
     def _find_radmin() -> str:

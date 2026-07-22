@@ -211,7 +211,10 @@ class FileTab(QWidget):
 
     def get_selected_target(self) -> int:
         idx = self._target_combo.currentIndex()
-        return self._target_combo.itemData(idx) if idx >= 0 else -1
+        if idx < 0:
+            return -1
+        data = self._target_combo.itemData(idx)
+        return data if data is not None else -1
 
     def _on_select_file(self) -> None:
         target_id = self.get_selected_target()

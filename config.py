@@ -5,6 +5,7 @@ Cuckoo 私有实时通信平台 —— 全局配置常量
 严禁擅自修改端口号或核心参数。
 """
 
+import sys
 import os as _os
 
 # ─────────────────────────────────────────────
@@ -58,8 +59,8 @@ FILE_SEND_DELAY: float = 0.001  # 每块发送间隔(秒)，防止占满带宽
 # 服务端参数
 # ─────────────────────────────────────────────
 MAX_CLIENTS: int = 9          # 最大房客数（ID 1-9）
-SEND_QUEUE_MAX: int = 30      # 每客户端信令/投屏队列上限（超过丢旧投屏帧）
-FILE_QUEUE_MAX: int = 200     # 每客户端文件块队列上限（严格FIFO，不丢弃）
+SEND_QUEUE_MAX: int = 100      # 每客户端信令/投屏队列上限（超过丢旧投屏帧）
+FILE_QUEUE_MAX: int = 1000     # 每客户端文件块队列上限（严格FIFO，不丢弃）
 ACCEPT_TIMEOUT: int = 300     # Accept 线程超时（秒）
 
 # ─────────────────────────────────────────────
@@ -77,4 +78,11 @@ WINDOW_HEIGHT: int = 768
 # ─────────────────────────────────────────────
 # 文件接收保存目录（项目内 downloads 文件夹）
 # ─────────────────────────────────────────────
-DOWNLOAD_DIR: str = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "downloads")
+if getattr(sys, 'frozen', False):
+    # 如果是打包后的 exe 运行，获取 exe 所在的真实目录
+    _BASE_DIR = _os.path.dirname(sys.executable)
+else:
+    # 如果是源码运行，获取当前文件所在目录
+    _BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
+
+DOWNLOAD_DIR: str = _os.path.join(_BASE_DIR, "downloads")

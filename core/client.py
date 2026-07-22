@@ -15,6 +15,7 @@ from common import logger as log
 from core.protocol import (
     build_frame, read_frame,
     MSG_TEXT, MSG_COMMAND, MSG_SCREEN_FRAME, MSG_FILE_META, MSG_FILE_CHUNK,
+    MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,  # 【修复】补充缺失的导入
     CMD_JOIN, CMD_JOIN_ACK, CMD_LEAVE, CMD_USER_LIST,
     HOST_ID, BROADCAST_ID
 )
@@ -52,7 +53,6 @@ class ClientConnection(QObject):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.settimeout(5.0)
         self._sock.connect((self._host_ip, config.TCP_PORT))
-        # 开启 TCP_NODELAY 禁用 Nagle 算法
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._sock.settimeout(None)
         self._running = True
@@ -147,17 +147,25 @@ class ClientConnection(QObject):
         self.user_list.emit(list(users.items()))
 
     def send_frame(self, msg_type: int, target_id: int, payload: bytes = b"") -> None:
-        """【致命Bug修复】：构建并发送一帧。使用非阻塞入队，防止 UI 或语音线程卡死。"""
+        """构建并发送一帧。控制信令带超时入队，数据块非阻塞入队。"""
         frame = build_frame(msg_type, self._my_id, target_id, payload)
-        try:
-            self._send_queue.put_nowait(frame)
-        except queue.Full:
-            # 队列满时，丢弃最旧的帧，保证新帧（通常是信令或最新状态）能发出
+        
+        # 【致命Bug修复】：控制信令必须可靠送达，使用带超时的阻塞入队（防止网络死锁卡死UI）
+        if msg_type in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_TEXT, MSG_COMMAND):
             try:
-                self._send_queue.get_nowait()
+                self._send_queue.put(frame, timeout=5.0)
+            except queue.Full:
+                log.warn(TAG, f"Send queue full, dropping control frame: {msg_type}")
+        else:
+            # 数据块（如文件块）使用非阻塞入队，满了丢弃旧块
+            try:
                 self._send_queue.put_nowait(frame)
-            except (queue.Empty, queue.Full):
-                pass
+            except queue.Full:
+                try:
+                    self._send_queue.get_nowait()
+                    self._send_queue.put_nowait(frame)
+                except (queue.Empty, queue.Full):
+                    pass
 
     def stop(self) -> None:
         self._running = False
