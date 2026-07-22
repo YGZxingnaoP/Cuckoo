@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QTabWidget, QPushButton,
     QMessageBox, QStatusBar, QHBoxLayout, QWidget
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 
 import socket
 import config
@@ -46,8 +46,10 @@ from func.screen_share.host import ScreenHost
 from func.screen_share.guest import ScreenGuest
 from func.voice_chat.mixer import AudioMixer
 from func.voice_chat.guest_audio import GuestAudio
+from func.voice_chat.system_audio import SystemAudioCapture
 from func.file_transfer.host_file import HostFileHandler
-from func.file_transfer.guest_file import GuestFileReceiver
+from func.file_transfer.guest_file import GuestFileReceiver, GuestFileSender
+
 
 TAG = "MainWindow"
 
@@ -69,6 +71,7 @@ class MainWindow(QMainWindow):
     _targets_changed = Signal(list)  # 房客加入/离开时更新目标列表
     _online_users_changed = Signal(dict)  # 在线用户列表变更 {uid: nickname}
     _voice_data_received = Signal(bytes)  # 语音独立 TCP 接收到的混合音频
+    _mic_error_signal = Signal(str)  # 麦克风启动失败（从后台线程发出）
 
     # 房主断开连接信号（房客端专用）
     host_disconnected = Signal()
@@ -96,18 +99,25 @@ class MainWindow(QMainWindow):
         self._guest_audio: Optional[GuestAudio] = None
         self._host_file: Optional[HostFileHandler] = None
         self._guest_file_recv: Optional[GuestFileReceiver] = None
+        self._guest_file_sender: Optional[GuestFileSender] = None
 
         # 主机麦克风采集线程
         self._host_mic_running = False
         self._host_mic_thread: Optional[threading.Thread] = None
+        self._host_input_device_index: int = -1
+        self._host_output_device_index: int = -1
 
         # 语音独立 TCP 连接（房客端）
         self._voice_sock: Optional[socket.socket] = None
         self._voice_send_thread: Optional[threading.Thread] = None
         self._voice_recv_thread: Optional[threading.Thread] = None
 
+        # 系统音频采集（WASAPI loopback，房主端）
+        self._system_audio_capture: Optional[SystemAudioCapture] = None
+
         self._init_ui()
         self._start_services()
+        self._populate_audio_devices()
         self._update_online_panel()
 
     # ═════════════════════════════════════════
@@ -132,7 +142,7 @@ class MainWindow(QMainWindow):
         # Tab 2: 语音
         self._voice_tab = VoiceTab()
         self._tabs.addTab(self._voice_tab, "语音")
-
+        
         # Tab 3: 文件
         self._file_tab = FileTab()
         self._tabs.addTab(self._file_tab, "文件")
@@ -147,6 +157,24 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self._online_panel)
         main_layout.addWidget(self._tabs, stretch=1)
         self.setCentralWidget(central)
+
+        # 浮动展开按钮（当在线面板折叠时显示，位于左上角）
+        self._btn_expand_panel = QPushButton("☰")
+        self._btn_expand_panel.setParent(self._tabs)
+        self._btn_expand_panel.setFixedSize(24, 24)
+        self._btn_expand_panel.move(2, 2)
+        self._btn_expand_panel.raise_()
+        self._btn_expand_panel.setStyleSheet(
+            "QPushButton { font-size: 12px; padding: 0; border: none; "
+            "background: transparent; color: #666; }"
+            "QPushButton:hover { color: #ccc; background: #333; border-radius: 3px; }"
+        )
+        self._btn_expand_panel.setToolTip("展开在线列表")
+        self._btn_expand_panel.clicked.connect(self._online_panel.toggle_collapse)
+        self._btn_expand_panel.hide()
+
+        # 在线面板折叠状态变更
+        self._online_panel.collapsed_changed.connect(self._on_panel_collapsed_changed)
 
         # ── 状态栏 ──
         self._status_bar = QStatusBar()
@@ -168,6 +196,9 @@ class MainWindow(QMainWindow):
         self._chat_tab.send_requested.connect(self._on_chat_send)
         self._file_tab.file_send_requested.connect(self._on_file_send)
         self._file_tab.folder_send_requested.connect(self._on_folder_send)
+        self._file_tab.resume_requested.connect(self._on_resume_requested)
+        self._file_tab.clear_requested.connect(self._on_clear_requested)
+
 
         # 线程安全 UI 更新信号连接
         self._send_status.connect(self._file_tab.set_status)
@@ -179,8 +210,23 @@ class MainWindow(QMainWindow):
         # 音量增益信号
         self._voice_tab.volume_gain_changed.connect(self._on_volume_gain_changed)
 
+        # 音频设备变更信号
+        self._voice_tab.device_changed.connect(self._on_voice_device_changed)
+        if self._is_host:
+            self._screen_tab.share_audio_toggled.connect(self._on_share_audio_toggled)
+            self._screen_tab.speaker_changed.connect(self._on_speaker_changed)
+
         # 语音数据接收信号（从独立 TCP 线程发出）
         self._voice_data_received.connect(self._on_voice_data_received)
+
+        # 麦克风错误信号（从后台线程发出）
+        self._mic_error_signal.connect(self._on_mic_error)
+
+        # 在线面板定时刷新定时器（保底机制，防止信号丢失）
+        self._online_refresh_timer = QTimer(self)
+        self._online_refresh_timer.setInterval(3000)  # 每 3 秒
+        self._online_refresh_timer.timeout.connect(self._on_online_refresh_tick)
+        self._online_refresh_timer.start()
 
     # ═════════════════════════════════════════
     # 服务启动
@@ -215,7 +261,11 @@ class MainWindow(QMainWindow):
             self._screen_host = ScreenHost(self._server)
 
             # 创建混音器（使用 TCP 发送回调）
-            self._audio_mixer = AudioMixer(send_callback=self._send_voice_to_client)
+            self._audio_mixer = AudioMixer(
+                send_callback=self._send_voice_to_client,
+                output_device_index=self._host_output_device_index
+            )
+            self._audio_mixer.set_get_client_ids_callback(self._get_online_client_ids)
             self._audio_mixer.start()
             self._audio_mixer.start_playback()  # 自动开始回放，主机始终能听到房客声音
 
@@ -313,14 +363,20 @@ class MainWindow(QMainWindow):
         self._connect_voice_tcp(assigned_id)
 
         # 初始化音频（打开扬声器输出，但不开麦）
-        self._guest_audio = GuestAudio(self._client, assigned_id, self._voice_sock)
+        self._guest_audio = GuestAudio(
+            self._client, assigned_id, self._voice_sock,
+            input_device_index=self._voice_tab.get_selected_input(),
+            output_device_index=self._voice_tab.get_selected_output()
+        )
         self._guest_audio.open_output()  # 立即可收听房主语音
 
-        # 初始化文件接收器
-        self._guest_file_recv = GuestFileReceiver()
+        # ── 初始化文件接收器 (【修复】传入 client_conn 并连接中断信号) ──
+        self._guest_file_recv = GuestFileReceiver(client_conn=self._client)
         self._guest_file_recv.progress.connect(self._file_tab.update_progress)
         self._guest_file_recv.file_complete.connect(self._on_file_complete)
         self._guest_file_recv.status_changed.connect(self._file_tab.set_status)
+        self._guest_file_recv.task_interrupted.connect(self._file_tab.add_interrupted_task)
+        self._guest_file_recv.task_removed.connect(self._file_tab.remove_interrupted_task)
 
         self._status_bar.showMessage(f"已连接房主 — ID: {assigned_id}")
         log.log(TAG, f"Joined as ID={assigned_id}")
@@ -376,19 +432,19 @@ class MainWindow(QMainWindow):
             self._voice_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._voice_sock.settimeout(5.0)
             self._voice_sock.connect((self._peer_ip, config.VOICE_TCP_PORT))
+            
+            # 【致命Bug修复】：开启 TCP_NODELAY 禁用 Nagle 算法，消除语音延迟
+            self._voice_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self._voice_sock.settimeout(None)
 
-            # 发送 uid 标识
             self._voice_sock.sendall(struct.pack("!I", assigned_id))
 
-            # 读取 ACK
             ack = self._voice_sock.recv(1)
             if not ack:
                 raise ConnectionError("Voice TCP: no ACK from server")
 
             log.log(TAG, f"Voice TCP connected on port {config.VOICE_TCP_PORT}")
 
-            # 启动语音接收线程
             self._voice_recv_thread = threading.Thread(
                 target=self._voice_recv_loop, daemon=True, name="GuestVoiceRecv"
             )
@@ -397,6 +453,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             log.error(TAG, f"Voice TCP connection failed: {e}")
             self._voice_sock = None
+
 
     def _voice_recv_loop(self) -> None:
         """语音接收线程：从独立 TCP 连接读取混合音频并通过信号分发给 UI。"""
@@ -449,18 +506,25 @@ class MainWindow(QMainWindow):
     # ═════════════════════════════════════════
 
     def _on_frame_received(self, msg_type: int, sender_id: int, target_id: int, payload: bytes) -> None:
-        """房客收到帧（由 ClientConnection 主 TCP 分发，语音已通过独立 TCP 处理）。"""
         if msg_type == MSG_TEXT:
             self._handle_text_guest(sender_id, payload)
         elif msg_type == MSG_SCREEN_FRAME:
-            if self._screen_guest:
-                self._screen_guest.push_frame_data(payload)
-        elif msg_type == MSG_FILE_META:
-            if self._guest_file_recv:
-                self._guest_file_recv.handle_file_meta(sender_id, payload)
+            if self._screen_guest: self._screen_guest.push_frame_data(payload)
+        elif msg_type == MSG_FILE_TASK_META:
+            if self._guest_file_recv: self._guest_file_recv.handle_task_meta(sender_id, payload)
         elif msg_type == MSG_FILE_CHUNK:
-            if self._guest_file_recv:
-                self._guest_file_recv.handle_file_chunk(sender_id, payload)
+            if self._guest_file_recv: self._guest_file_recv.handle_file_chunk(sender_id, payload)
+        elif msg_type == MSG_FILE_RESUME_REQ:
+            try:
+                import json
+                req_task = json.loads(payload.decode("utf-8"))
+                # 动态创建或复用 Sender
+                if not self._guest_file_sender or self._guest_file_sender.task_id != req_task["task_id"]:
+                    from func.file_transfer.guest_file import GuestFileSender
+                    self._guest_file_sender = GuestFileSender.from_json(self._client, req_task)
+                self._guest_file_sender.handle_resume_req(payload)
+            except Exception as e:
+                log.error(TAG, f"Guest parse resume req error: {e}")
 
     def _handle_text_guest(self, sender_id: int, payload: bytes) -> None:
         """房客处理文本消息。"""
@@ -507,6 +571,13 @@ class MainWindow(QMainWindow):
                     info.voice_send_queue.put_nowait(frame)
                 except Exception:
                     pass
+
+    def _get_online_client_ids(self) -> list[int]:
+        """混音器回调：获取当前所有在线房客的 ID 列表。"""
+        if self._server:
+            with self._server._clients_lock:
+                return list(self._server._clients.keys())
+        return []
 
     # ═════════════════════════════════════════
     # 事件处理
@@ -581,18 +652,32 @@ class MainWindow(QMainWindow):
             log.log(TAG, "Host mic on")
 
     def _host_mic_loop(self) -> None:
-        """房主麦克风采集循环。"""
+        """房主麦克风采集循环（带采样率回退）。"""
         import pyaudio
+        pa = None
+        stream = None
         try:
             pa = pyaudio.PyAudio()
-            stream = pa.open(
+            stream_kwargs = dict(
                 format=pyaudio.paInt16,
                 channels=config.AUDIO_CHANNELS,
-                rate=config.AUDIO_RATE,
                 input=True,
                 frames_per_buffer=config.AUDIO_CHUNK
             )
-            log.log(TAG, "Host mic loop started")
+            if self._host_input_device_index >= 0:
+                stream_kwargs['input_device_index'] = self._host_input_device_index
+            # 采样率回退
+            for rate in [config.AUDIO_RATE, 44100, 48000]:
+                try:
+                    stream_kwargs['rate'] = rate
+                    stream = pa.open(**stream_kwargs)
+                    log.log(TAG, f"Host mic opened (rate={rate}, device={self._host_input_device_index})")
+                    break
+                except Exception as e:
+                    log.warn(TAG, f"Host mic rate {rate} failed: {e}")
+                    stream = None
+            if stream is None:
+                raise RuntimeError("所有采样率均失败")
             count = 0
             while self._host_mic_running:
                 pcm = stream.read(config.AUDIO_CHUNK, exception_on_overflow=False)
@@ -608,6 +693,18 @@ class MainWindow(QMainWindow):
         except Exception as e:
             log.error(TAG, f"Host mic error: {e}")
             self._host_mic_running = False
+            self._mic_error_signal.emit(str(e))
+            if stream:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
+            if pa:
+                try:
+                    pa.terminate()
+                except Exception:
+                    pass
 
     def _toggle_guest_mic(self) -> None:
         """房客麦克风切换。"""
@@ -637,132 +734,30 @@ class MainWindow(QMainWindow):
             self._client.send_frame(MSG_TEXT, HOST_ID, data)
 
     def _on_file_send(self, file_path: str, target_id: int) -> None:
-        """发送文件。"""
         if self._is_host and self._host_file:
             self._host_file.send_file(file_path, target_id)
         elif self._client:
-            # 房客发送文件（通过 ClientConnection 发给房主中转）
-            self._guest_send_file(file_path, target_id)
+            if not self._guest_file_sender:
+                from func.file_transfer.guest_file import GuestFileSender
+                self._guest_file_sender = GuestFileSender(self._client)
+            self._guest_file_sender.send_file(file_path, target_id, self._my_id)
 
     def _on_folder_send(self, folder_path: str, target_id: int) -> None:
-        """发送文件夹。"""
         if self._is_host and self._host_file:
             self._host_file.send_folder(folder_path, target_id)
         elif self._client:
-            self._guest_send_folder(folder_path, target_id)
+            if not self._guest_file_sender:
+                from func.file_transfer.guest_file import GuestFileSender
+                self._guest_file_sender = GuestFileSender(self._client)
+            self._guest_file_sender.send_folder(folder_path, target_id, self._my_id)
 
-    def _guest_send_file(self, file_path: str, target_id: int) -> None:
-        """房客发送文件给指定用户（通过房主中转）。"""
-        import threading
-        threading.Thread(
-            target=self._guest_file_loop,
-            args=(file_path, target_id, ""),
-            daemon=True, name="GuestFileSend"
-        ).start()
+    def _on_resume_requested(self, task_id: str):
+        if self._guest_file_recv:
+            self._guest_file_recv.resume_task(task_id)
 
-    def _guest_send_folder(self, folder_path: str, target_id: int) -> None:
-        """房客发送文件夹给指定用户（通过房主中转）。"""
-        import threading
-        threading.Thread(
-            target=self._guest_folder_loop,
-            args=(folder_path, target_id),
-            daemon=True, name="GuestFolderSend"
-        ).start()
-
-    def _guest_file_loop(self, file_path: str, target_id: int, base_name: str = "") -> None:
-        """房客文件发送循环。"""
-        try:
-            filename = os.path.basename(file_path)
-            file_size = os.path.getsize(file_path)
-            name_bytes = filename.encode("utf-8")
-            base_bytes = base_name.encode("utf-8")
-
-            # 元数据: [4B base_name_len][base_name][4B name_len][name][8B size][4B target_id]
-            meta = bytearray()
-            meta.extend(struct.pack("!I", len(base_bytes)))
-            meta.extend(base_bytes)
-            meta.extend(struct.pack("!I", len(name_bytes)))
-            meta.extend(name_bytes)
-            meta.extend(struct.pack("!Q", file_size))
-            meta.extend(struct.pack("!I", target_id))
-
-            self._client.send_frame(MSG_FILE_META, BROADCAST_ID, bytes(meta))
-
-            display = f"{base_name}/{filename}" if base_name else filename
-            self._send_status.emit(f"正在发送: {display}")
-
-            # 数据块（自适应限速：监控发送队列深度）
-            import time
-            with open(file_path, "rb") as f:
-                while True:
-                    chunk = f.read(config.FILE_CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    self._client.send_frame(MSG_FILE_CHUNK, BROADCAST_ID, chunk)
-                    # 自适应限速：队列积压时等待，空闲时快速发送
-                    while self._client._send_queue.qsize() > config.SEND_QUEUE_MAX * 2:
-                        time.sleep(0.005)
-
-            self._send_status.emit(f"发送完成: {display}")
-            self._send_progress.emit(100, "完成", "")
-            log.log(TAG, f"File sent: {display} to {target_id}")
-
-        except OSError as e:
-            log.error(TAG, f"File send error: {e}")
-            self._send_status.emit(f"发送失败: {e}")
-
-    def _guest_folder_loop(self, folder_path: str, target_id: int) -> None:
-        """房客文件夹发送循环（遍历文件夹逐个发送）。"""
-        folder_name = os.path.basename(folder_path)
-        file_list = []
-        for root, dirs, files in os.walk(folder_path):
-            for fname in files:
-                full_path = os.path.join(root, fname)
-                rel_path = os.path.relpath(full_path, folder_path)
-                file_list.append((full_path, rel_path))
-
-        total = len(file_list)
-        self._send_status.emit(f"正在发送文件夹: {folder_name} ({total} 个文件)")
-        log.log(TAG, f"Sending folder '{folder_name}' with {total} files to {target_id}")
-
-        import time
-        for idx, (full_path, rel_path) in enumerate(file_list, 1):
-            try:
-                file_size = os.path.getsize(full_path)
-                rel_bytes = rel_path.encode("utf-8")
-                base_bytes = folder_name.encode("utf-8")
-
-                # 元数据
-                meta = bytearray()
-                meta.extend(struct.pack("!I", len(base_bytes)))
-                meta.extend(base_bytes)
-                meta.extend(struct.pack("!I", len(rel_bytes)))
-                meta.extend(rel_bytes)
-                meta.extend(struct.pack("!Q", file_size))
-                meta.extend(struct.pack("!I", target_id))
-
-                self._client.send_frame(MSG_FILE_META, BROADCAST_ID, bytes(meta))
-                self._send_status.emit(f"[{idx}/{total}] {rel_path}")
-
-                # 数据块（自适应限速）
-                with open(full_path, "rb") as f:
-                    while True:
-                        chunk = f.read(config.FILE_CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        self._client.send_frame(MSG_FILE_CHUNK, BROADCAST_ID, chunk)
-                        while self._client._send_queue.qsize() > config.SEND_QUEUE_MAX * 2:
-                            time.sleep(0.005)
-
-                time.sleep(0.01)
-
-            except OSError as e:
-                log.error(TAG, f"File send error ({rel_path}): {e}")
-                continue
-
-        self._send_status.emit(f"文件夹发送完成: {folder_name} ({total} 个文件)")
-        self._send_progress.emit(100, "完成", "")
-        log.log(TAG, f"Folder sent: {folder_name} to {target_id}")
+    def _on_clear_requested(self, task_id: str):
+        if self._guest_file_recv:
+            self._guest_file_recv.clear_task(task_id)
 
     def _on_file_complete(self, path: str) -> None:
         self._file_tab.set_status(f"接收完成: {os.path.basename(path)}")
@@ -774,6 +769,12 @@ class MainWindow(QMainWindow):
         else:
             self._status_bar.showMessage("房主离线")
 
+    def _on_mic_error(self, error_msg: str) -> None:
+        """主线程槽：麦克风启动失败时重置 UI 状态。"""
+        self._voice_tab.set_mic_off()
+        self._host_mic_running = False
+        QMessageBox.warning(self, "麦克风错误", f"麦克风启动失败：\n{error_msg}\n\n请检查音频设备或在设备列表中选择其他设备。")
+
     def _on_volume_gain_changed(self, gain_percent: int) -> None:
         """音量增益变更处理。"""
         if self._guest_audio:
@@ -781,9 +782,108 @@ class MainWindow(QMainWindow):
         if self._audio_mixer:
             self._audio_mixer.set_volume_gain(gain_percent)
 
+    # ═════════════════════════════════════════
+    # 音频设备枚举与切换
+    # ═════════════════════════════════════════
+
+    def _populate_audio_devices(self) -> None:
+        """枚举系统音频设备并填充下拉框。"""
+        try:
+            import pyaudio
+            pa = pyaudio.PyAudio()
+            input_devices = []
+            output_devices = []
+            for i in range(pa.get_device_count()):
+                info = pa.get_device_info_by_index(i)
+                name = info.get("name", f"设备 {i}")
+                # 清理编码名称
+                try:
+                    name = name.encode("utf-8", errors="ignore").decode("utf-8")
+                except Exception:
+                    name = f"设备 {i}"
+                if info.get("maxInputChannels", 0) > 0:
+                    input_devices.append((name, i))
+                if info.get("maxOutputChannels", 0) > 0:
+                    output_devices.append((name, i))
+            pa.terminate()
+
+            self._voice_tab.set_devices(input_devices, output_devices)
+            if self._is_host:
+                # 填充扬声器列表（用于系统音频采集）
+                speakers = SystemAudioCapture.get_speaker_list()
+                self._screen_tab.set_speakers(speakers)
+            log.log(TAG, f"Audio devices: {len(input_devices)} input, {len(output_devices)} output")
+        except Exception as e:
+            log.error(TAG, f"Failed to enumerate audio devices: {e}")
+
+    def _on_voice_device_changed(self, input_idx: int, output_idx: int) -> None:
+        """语音页面设备切换处理（实时重启麦克风采集）。"""
+        self._host_input_device_index = input_idx
+        self._host_output_device_index = output_idx
+        if self._guest_audio:
+            self._guest_audio.set_device(input_idx, output_idx)
+        if self._audio_mixer:
+            self._audio_mixer.set_device(input_idx, output_idx)
+        # 如果房主麦克风正在运行，重启以应用新设备
+        if self._is_host and self._host_mic_running:
+            log.log(TAG, "Restarting host mic for device change...")
+            # 先停止
+            self._host_mic_running = False
+            if self._host_mic_thread and self._host_mic_thread.is_alive():
+                self._host_mic_thread.join(timeout=3)
+            # 再重启
+            self._host_mic_running = True
+            self._host_mic_thread = threading.Thread(
+                target=self._host_mic_loop, daemon=True, name="HostMic"
+            )
+            self._host_mic_thread.start()
+            log.log(TAG, "Host mic restarted with new device")
+        log.log(TAG, f"Voice device changed: input={input_idx}, output={output_idx}")
+
+    def _on_share_audio_toggled(self, enabled: bool) -> None:
+        """共享电脑声音开关切换。"""
+        if enabled:
+            self._start_system_audio_capture()
+        else:
+            self._stop_system_audio_capture()
+
+    def _on_speaker_changed(self, speaker_name: str) -> None:
+        """采集扬声器切换——重启系统音频采集。"""
+        if self._system_audio_capture and self._screen_tab.is_share_audio_enabled():
+            self._stop_system_audio_capture()
+            self._start_system_audio_capture()
+
+    def _start_system_audio_capture(self) -> None:
+        """启动系统音频采集（WASAPI loopback）。"""
+        if not self._audio_mixer:
+            return
+        if self._system_audio_capture is None:
+            self._system_audio_capture = SystemAudioCapture(
+                push_callback=self._audio_mixer.push_system_audio
+            )
+        speaker_name = self._screen_tab.get_selected_speaker() or None
+        self._system_audio_capture.start(device_name=speaker_name)
+        log.log(TAG, f"System audio capture started (speaker={speaker_name})")
+
+    def _stop_system_audio_capture(self) -> None:
+        """停止系统音频采集。"""
+        if self._system_audio_capture:
+            self._system_audio_capture.stop()
+        log.log(TAG, "System audio capture stopped")
+
     def _update_online_panel(self) -> None:
         """刷新在线列表面板。"""
         self._online_panel.update_users(self._nicknames.get_all())
+
+    def _on_online_refresh_tick(self) -> None:
+        """定时器触发：保底刷新在线面板。"""
+        self._online_panel.update_users(self._nicknames.get_all())
+
+    def _on_panel_collapsed_changed(self, collapsed: bool) -> None:
+        """在线面板折叠状态变更：显示/隐藏浮动展开按钮。"""
+        self._btn_expand_panel.setVisible(collapsed)
+        if collapsed:
+            self._btn_expand_panel.raise_()
 
     # ═════════════════════════════════════════
     # 窗口关闭
@@ -793,6 +893,9 @@ class MainWindow(QMainWindow):
         """清理所有资源。"""
         log.log(TAG, "Shutting down...")
 
+        # 停止定时器
+        self._online_refresh_timer.stop()
+
         # 停止投屏
         if self._screen_host:
             self._screen_host.stop()
@@ -800,6 +903,8 @@ class MainWindow(QMainWindow):
             self._screen_guest.stop()
 
         # 停止音频
+        if self._system_audio_capture:
+            self._system_audio_capture.stop()
         if self._audio_mixer:
             self._audio_mixer.stop()
         if self._guest_audio:

@@ -39,11 +39,14 @@ FPS_PRESETS: list = [
 DEFAULT_FPS_PRESET: int = 0  # 默认15fps
 
 # ─────────────────────────────────────────────
-# 语音参数
+# 语音参数（低延迟优化：端到端 < 120ms）
 # ─────────────────────────────────────────────
-AUDIO_CHUNK: int = 1024       # 每次采集帧大小（样本数）
+AUDIO_CHUNK: int = 512        # 每次采集帧大小（样本数）→ 512/16000=32ms
 AUDIO_RATE: int = 16000       # 采样率 Hz
 AUDIO_CHANNELS: int = 1       # 单声道
+VOICE_SEND_QUEUE_MAX: int = 3 # 语音发送队列上限（极小值，满则丢旧包）
+VOICE_PLAY_QUEUE_MAX: int = 8 # 语音播放队列上限
+MIX_INTERVAL: float = 0.032   # 混音时间片（秒）→ 32ms
 
 # ─────────────────────────────────────────────
 # 文件传输参数

@@ -5,7 +5,7 @@
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QPushButton,
-    QSlider, QHBoxLayout, QGroupBox
+    QSlider, QHBoxLayout, QGroupBox, QComboBox
 )
 from PySide6.QtCore import Qt, Signal
 
@@ -19,6 +19,8 @@ class VoiceTab(QWidget):
     toggle_mic_requested = Signal()
     # 音量增幅变更信号 (gain_percent: 50~300, 100=原始)
     volume_gain_changed = Signal(int)
+    # 音频设备变更信号 (input_device_index, output_device_index)
+    device_changed = Signal(int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -36,7 +38,35 @@ class VoiceTab(QWidget):
         self._status_label.setStyleSheet("font-size: 18px; color: #ccc;")
         layout.addWidget(self._status_label)
 
-        layout.addSpacing(30)
+        layout.addSpacing(20)
+
+        # ── 音频设备选择 ──
+        dev_group = QGroupBox("音频设备")
+        dev_layout = QVBoxLayout(dev_group)
+
+        # 输入设备（麦克风）
+        in_row = QHBoxLayout()
+        in_row.addWidget(QLabel("输入设备："))
+        self._input_combo = QComboBox()
+        self._input_combo.setObjectName("inputDeviceCombo")
+        self._input_combo.setMinimumWidth(250)
+        self._input_combo.currentIndexChanged.connect(self._on_device_changed)
+        in_row.addWidget(self._input_combo, stretch=1)
+        dev_layout.addLayout(in_row)
+
+        # 输出设备（扬声器）
+        out_row = QHBoxLayout()
+        out_row.addWidget(QLabel("输出设备："))
+        self._output_combo = QComboBox()
+        self._output_combo.setObjectName("outputDeviceCombo")
+        self._output_combo.setMinimumWidth(250)
+        self._output_combo.currentIndexChanged.connect(self._on_device_changed)
+        out_row.addWidget(self._output_combo, stretch=1)
+        dev_layout.addLayout(out_row)
+
+        layout.addWidget(dev_group, alignment=Qt.AlignCenter)
+
+        layout.addSpacing(10)
 
         self._btn_mic = QPushButton("开启麦克风")
         self._btn_mic.setObjectName("btnMic")
@@ -74,6 +104,12 @@ class VoiceTab(QWidget):
 
         layout.addWidget(gain_group, alignment=Qt.AlignCenter)
 
+    def _on_device_changed(self, index: int) -> None:
+        in_idx = self._input_combo.currentData()
+        out_idx = self._output_combo.currentData()
+        if in_idx is not None and out_idx is not None:
+            self.device_changed.emit(in_idx, out_idx)
+
     def _on_toggle_mic(self) -> None:
         self.toggle_mic_requested.emit()
 
@@ -98,3 +134,26 @@ class VoiceTab(QWidget):
     @property
     def gain_percent(self) -> int:
         return self._gain_slider.value()
+
+    def set_devices(self, input_devices: list, output_devices: list) -> None:
+        """设置可选设备列表。格式: [(name, device_index), ...]"""
+        self._input_combo.blockSignals(True)
+        self._output_combo.blockSignals(True)
+        self._input_combo.clear()
+        self._output_combo.clear()
+        for name, idx in input_devices:
+            self._input_combo.addItem(name, idx)
+        for name, idx in output_devices:
+            self._output_combo.addItem(name, idx)
+        self._input_combo.blockSignals(False)
+        self._output_combo.blockSignals(False)
+
+    def get_selected_input(self) -> int:
+        """获取选中的输入设备索引。"""
+        data = self._input_combo.currentData()
+        return data if data is not None else -1
+
+    def get_selected_output(self) -> int:
+        """获取选中的输出设备索引。"""
+        data = self._output_combo.currentData()
+        return data if data is not None else -1

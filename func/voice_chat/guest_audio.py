@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-语音模块 —— 房客端音频收发（独立 TCP 传输）
-职责：
-  1. 麦克风采集 → 通过独立语音 TCP Socket 发送给房主
-  2. 从房主接收混合音频（独立语音 TCP）→ 扬声器播放
+语音模块 —— 房客端音频收发 (集成专业音频管道)
 """
 
 import socket
@@ -11,304 +8,204 @@ import queue
 import threading
 from typing import Optional
 
-import numpy as np
 import pyaudio
 
 from common import logger as log
 from core.protocol import build_frame, MSG_VOICE, HOST_ID
+from func.voice_chat.audio_pipeline import TxPipeline, RxPipeline
 import config
 
 TAG = "GuestAudio"
 
-
 class GuestAudio:
-    """
-    房客音频处理器（TCP 模式）。
-    - 麦克风采集通过独立语音 TCP Socket 发送给房主
-    - 从房主接收混合音频并通过独立播放线程播放
-    """
-
-    def __init__(self, client_conn, client_id: int = 0, voice_sock: Optional[socket.socket] = None):
-        """
-        :param client_conn: ClientConnection 实例（备用）
-        :param client_id: 本房客被分配的 ID
-        :param voice_sock: 独立语音 TCP Socket
-        """
+    def __init__(self, client_conn, client_id: int = 0, voice_sock: Optional[socket.socket] = None,
+                 input_device_index: int = -1, output_device_index: int = -1):
         self._client_conn = client_conn
         self._client_id = client_id
         self._voice_sock = voice_sock
+        self._input_device_index = input_device_index if input_device_index >= 0 else None
+        self._output_device_index = output_device_index if output_device_index >= 0 else None
         self._running = False
         self._pa: Optional[pyaudio.PyAudio] = None
         self._input_stream: Optional[pyaudio.Stream] = None
         self._output_stream: Optional[pyaudio.Stream] = None
+        
         self._send_thread: Optional[threading.Thread] = None
         self._voice_send_thread: Optional[threading.Thread] = None
-        self._voice_send_queue: queue.Queue = queue.Queue(maxsize=5)  # 极小有界队列，满时丢旧包
+        self._voice_send_queue: queue.Queue = queue.Queue(maxsize=config.VOICE_SEND_QUEUE_MAX)
         self._play_thread: Optional[threading.Thread] = None
-        self._play_queue: queue.Queue = queue.Queue(maxsize=50)
         self._mic_on = False
-        self._volume_gain: float = 1.0  # 音量增益倍率 (1.0 = 原始)
-        self._gain_lock = threading.Lock()
+        
+        # 【核心重构】：引入专业音频管道
+        self.tx_pipeline = TxPipeline(sample_rate=config.AUDIO_RATE)
+        self.rx_pipeline = RxPipeline(sample_rate=config.AUDIO_RATE, chunk_size_ms=20, buffer_size_ms=60)
+
+        # 设备热插拔版本控制
+        self._device_version = 0
+        self._current_input_version = -1
+        self._current_output_version = -1
 
     @property
-    def mic_on(self) -> bool:
-        return self._mic_on
+    def mic_on(self) -> bool: return self._mic_on
 
-    def set_client_id(self, cid: int) -> None:
-        self._client_id = cid
+    def set_device(self, input_device_index: int, output_device_index: int) -> None:
+        self._input_device_index = input_device_index if input_device_index >= 0 else None
+        self._output_device_index = output_device_index if output_device_index >= 0 else None
+        self._device_version += 1
 
-    def set_volume_gain(self, gain_percent: int) -> None:
-        """设置音量增益（百分比，100=原始）。"""
-        with self._gain_lock:
-            self._volume_gain = gain_percent / 100.0
-        log.log(TAG, f"Volume gain set to {gain_percent}% ({gain_percent / 100.0:.2f}x)")
+    def set_noise_gate(self, level: float) -> None:
+        """设置降噪等级 (0.0 ~ 0.1)"""
+        self.tx_pipeline.set_noise_gate(level)
 
-    # ═════════════════════════════════════════
-    # 扬声器输出（加入房间后即可打开，无需开麦）
-    # ═════════════════════════════════════════
+    def set_jitter_buffer(self, buffer_ms: int) -> None:
+        """设置抖动缓冲大小 (20 ~ 200 ms)"""
+        self.rx_pipeline.set_buffer_size(buffer_ms)
 
     def open_output(self) -> bool:
-        """打开扬声器输出流 + 播放线程（加入房间后调用）。"""
-        if self._output_stream is not None:
-            return True
+        if self._output_stream is not None: return True
         try:
-            if self._pa is None:
-                self._pa = pyaudio.PyAudio()
-            self._output_stream = self._pa.open(
-                format=pyaudio.paInt16,
-                channels=config.AUDIO_CHANNELS,
-                rate=config.AUDIO_RATE,
-                output=True,
-                frames_per_buffer=config.AUDIO_CHUNK
-            )
+            if self._pa is None: self._pa = pyaudio.PyAudio()
+            self._output_stream = self._open_stream_safe(output=True)
+            if not self._output_stream: raise RuntimeError("Output init failed")
             self._running = True
-            # 启动播放线程
-            self._play_thread = threading.Thread(
-                target=self._play_loop, daemon=True, name="GuestAudioPlay"
-            )
+            self._play_thread = threading.Thread(target=self._play_loop, daemon=True, name="GuestAudioPlay")
             self._play_thread.start()
-            log.log(TAG, "Output stream opened (playback ready)")
             return True
         except Exception as e:
             log.error(TAG, f"Output init error: {e}")
             return False
 
-    # ═════════════════════════════════════════
-    # 麦克风（开麦时才启动发送）
-    # ═════════════════════════════════════════
-
     def start_mic(self) -> bool:
-        """开启麦克风，开始发送音频。"""
-        if self._mic_on:
-            return True
-        # 确保输出已打开
-        if not self.open_output():
-            log.error(TAG, "Cannot start mic: output not ready")
-            return False
+        if self._mic_on: return True
+        if not self.open_output(): return False
         try:
-            if self._input_stream is None:
-                self._input_stream = self._pa.open(
-                    format=pyaudio.paInt16,
-                    channels=config.AUDIO_CHANNELS,
-                    rate=config.AUDIO_RATE,
-                    input=True,
-                    frames_per_buffer=config.AUDIO_CHUNK
-                )
+            self._input_stream = self._open_stream_safe(output=False)
+            if not self._input_stream: raise RuntimeError("Input init failed")
             self._mic_on = True
 
-            # 启动网络发送线程（独立于采集，避免 sendall 阻塞拖慢采集）
-            self._voice_send_thread = threading.Thread(
-                target=self._voice_net_send_loop, daemon=True, name="GuestVoiceNetSend"
-            )
+            self._voice_send_thread = threading.Thread(target=self._voice_net_send_loop, daemon=True)
             self._voice_send_thread.start()
-
-            # 启动采集线程
-            self._send_thread = threading.Thread(
-                target=self._send_loop, daemon=True, name="GuestAudioSend"
-            )
+            self._send_thread = threading.Thread(target=self._send_loop, daemon=True)
             self._send_thread.start()
-
-            log.log(TAG, "Mic started (TCP mode)")
             return True
-
         except Exception as e:
             log.error(TAG, f"Mic init error: {e}")
             return False
 
     def stop_mic(self) -> None:
-        """关闭麦克风（停止发送，但保持输出流以便继续收听）。"""
         self._mic_on = False
         if self._input_stream:
-            try:
-                self._input_stream.stop_stream()
-                self._input_stream.close()
-            except Exception:
-                pass
+            try: self._input_stream.stop_stream(); self._input_stream.close()
+            except Exception: pass
             self._input_stream = None
-        # 停止采集线程
-        if self._send_thread:
-            self._send_thread.join(timeout=2)
-            self._send_thread = None
-        # 停止网络发送线程
-        self._voice_send_queue.put(None)  # 哨兵
-        if self._voice_send_thread:
-            self._voice_send_thread.join(timeout=2)
-            self._voice_send_thread = None
-        log.log(TAG, "Mic stopped (output still active)")
+        if self._send_thread: self._send_thread.join(timeout=2)
+        self._voice_send_queue.put(None)
+        if self._voice_send_thread: self._voice_send_thread.join(timeout=2)
 
     def stop(self) -> None:
-        """停止所有音频收发。"""
         self._running = False
         self._mic_on = False
-
         if self._input_stream:
-            try:
-                self._input_stream.stop_stream()
-                self._input_stream.close()
-            except Exception:
-                pass
-            self._input_stream = None
-
+            try: self._input_stream.stop_stream(); self._input_stream.close()
+            except Exception: pass
         if self._output_stream:
-            try:
-                self._output_stream.stop_stream()
-                self._output_stream.close()
-            except Exception:
-                pass
-            self._output_stream = None
-
-        if self._pa:
-            self._pa.terminate()
-            self._pa = None
-
-        # 停止采集线程
-        if self._send_thread:
-            self._send_thread.join(timeout=2)
-        # 停止网络发送线程
+            try: self._output_stream.stop_stream(); self._output_stream.close()
+            except Exception: pass
+        if self._pa: self._pa.terminate()
+        
+        if self._send_thread: self._send_thread.join(timeout=2)
         self._voice_send_queue.put(None)
-        if self._voice_send_thread:
-            self._voice_send_thread.join(timeout=2)
-        # 停止播放线程
-        if self._play_thread:
-            self._play_thread.join(timeout=2)
+        if self._voice_send_thread: self._voice_send_thread.join(timeout=2)
+        if self._play_thread: self._play_thread.join(timeout=2)
 
-        # 清空播放队列
-        while not self._play_queue.empty():
+    def _open_stream_safe(self, output: bool) -> Optional[pyaudio.Stream]:
+        stream_kwargs = dict(
+            format=pyaudio.paInt16, channels=config.AUDIO_CHANNELS,
+            output=output, input=not output, frames_per_buffer=config.AUDIO_CHUNK
+        )
+        idx = self._output_device_index if output else self._input_device_index
+        if idx is not None:
+            stream_kwargs['output_device_index' if output else 'input_device_index'] = idx
+
+        for rate in [config.AUDIO_RATE, 44100, 48000]:
             try:
-                self._play_queue.get_nowait()
-            except queue.Empty:
-                break
+                stream_kwargs['rate'] = rate
+                return self._pa.open(**stream_kwargs)
+            except Exception: pass
+        return None
 
-        log.log(TAG, "Audio stopped")
-
-    # ═════════════════════════════════════════
-    # 发送循环（麦克风 → TCP → 房主）
-    # ═════════════════════════════════════════
+    def _rebuild_stream_if_needed(self, is_input: bool) -> None:
+        if self._device_version == (self._current_input_version if is_input else self._current_output_version):
+            return
+        stream = self._input_stream if is_input else self._output_stream
+        if stream:
+            try: stream.stop_stream(); stream.close()
+            except Exception: pass
+        new_stream = self._open_stream_safe(output=not is_input)
+        if is_input:
+            self._input_stream = new_stream
+            self._current_input_version = self._device_version
+        else:
+            self._output_stream = new_stream
+            self._current_output_version = self._device_version
 
     def _send_loop(self) -> None:
-        """采集循环：从麦克风读取音频 → 放入有界发送队列（非阻塞，满则丢旧包）。"""
-        log.log(TAG, "Capture loop started (Voice TCP)")
-        count = 0
+        """采集循环：麦克风 -> TxPipeline(降噪) -> 网络队列"""
         while self._running and self._mic_on:
+            self._rebuild_stream_if_needed(is_input=True)
+            if not self._input_stream:
+                threading.Event().wait(0.1)
+                continue
             try:
-                pcm_data = self._input_stream.read(
-                    config.AUDIO_CHUNK, exception_on_overflow=False
-                )
+                pcm_data = self._input_stream.read(config.AUDIO_CHUNK, exception_on_overflow=False)
+                
+                # 【核心重构】：经过发送端管道处理（降噪）
+                processed_pcm = self.tx_pipeline.process(pcm_data)
+                
                 if self._voice_sock:
-                    frame = build_frame(MSG_VOICE, self._client_id, HOST_ID, pcm_data)
-                    # 非阻塞入队：队列满时丢弃最旧包，确保采集不阻塞
+                    frame = build_frame(MSG_VOICE, self._client_id, HOST_ID, processed_pcm)
                     if self._voice_send_queue.full():
-                        try:
-                            self._voice_send_queue.get_nowait()
-                        except queue.Empty:
-                            pass
-                    try:
-                        self._voice_send_queue.put_nowait(frame)
-                    except queue.Full:
-                        pass
-                count += 1
-                if count % 50 == 1:
-                    rms = np.sqrt(np.mean(np.frombuffer(pcm_data, dtype=np.int16).astype(np.float64) ** 2))
-                    log.log(TAG, f"[CAPTURE] pkt#{count} rms={rms:.0f} qsize={self._voice_send_queue.qsize()}")
+                        try: self._voice_send_queue.get_nowait()
+                        except queue.Empty: pass
+                    try: self._voice_send_queue.put_nowait(frame)
+                    except queue.Full: pass
             except Exception as e:
-                if self._running and self._mic_on:
-                    log.error(TAG, f"Audio capture error: {e}")
+                if self._running and self._mic_on: log.error(TAG, f"Audio capture error: {e}")
                 break
-        log.log(TAG, f"Capture loop stopped (total={count})")
 
     def _voice_net_send_loop(self) -> None:
-        """网络发送线程：从有界队列取帧 → sendall（阻塞仅影响此线程，不拖慢采集）。"""
-        log.log(TAG, "Voice net send loop started")
-        count = 0
         while self._running:
             try:
                 frame = self._voice_send_queue.get(timeout=0.5)
-                if frame is None:  # 哨兵值
-                    break
-                if self._voice_sock:
-                    self._voice_sock.sendall(frame)
-                count += 1
-            except queue.Empty:
-                continue
-            except (ConnectionError, OSError) as e:
-                log.error(TAG, f"Voice net send error: {e}")
-                break
-        log.log(TAG, f"Voice net send loop stopped (total={count})")
+                if frame is None: break
+                if self._voice_sock: self._voice_sock.sendall(frame)
+            except queue.Empty: continue
+            except (ConnectionError, OSError): break
 
-    # ═════════════════════════════════════════
-    # 播放循环（独立线程，不阻塞 Qt 主线程）
-    # ═════════════════════════════════════════
+    def set_jitter_buffer(self, buffer_ms: int) -> None:
+        """设置抖动缓冲大小 (20 ~ 200 ms)"""
+        self.rx_pipeline.set_buffer_size(buffer_ms)
 
-    def _apply_gain(self, pcm_data: bytes) -> bytes:
-        """对 PCM 数据应用音量增益。"""
-        with self._gain_lock:
-            gain = self._volume_gain
-        if abs(gain - 1.0) < 0.01:
-            return pcm_data
-        samples = np.frombuffer(pcm_data, dtype=np.int16).astype(np.int32)
-        samples = (samples * gain).clip(-32768, 32767).astype(np.int16)
-        return samples.tobytes()
+    def set_volume_gain(self, gain_percent: int) -> None:
+        """【新增】设置播放音量增益"""
+        self.rx_pipeline.set_volume_gain(gain_percent)
 
     def _play_loop(self) -> None:
-        """播放线程：从队列取音频数据写入扬声器。"""
-        log.log(TAG, "Playback loop started")
-        count = 0
+        """【核心重构】：播放循环与网络接收彻底解耦，由 Jitter Buffer 驱动"""
         while self._running:
-            try:
-                pcm_data = self._play_queue.get(timeout=0.005)
-                if pcm_data is None:
-                    break
-                if self._output_stream:
-                    pcm_data = self._apply_gain(pcm_data)
-                    self._output_stream.write(pcm_data)
-                count += 1
-                if count % 50 == 1:
-                    rms = np.sqrt(np.mean(np.frombuffer(pcm_data, dtype=np.int16).astype(np.float64) ** 2))
-                    log.log(TAG, f"[PLAY] pkt#{count} rms={rms:.0f}")
-            except queue.Empty:
+            self._rebuild_stream_if_needed(is_input=False)
+            if not self._output_stream:
+                threading.Event().wait(0.1)
                 continue
+            try:
+                # 从抖动缓冲区拉取数据，并经过 RxPipeline 处理 (AGC + 软限幅)
+                pcm_data = self.rx_pipeline.pull_and_process()
+                self._output_stream.write(pcm_data)
             except Exception as e:
-                if self._running:
-                    log.error(TAG, f"Playback error: {e}")
+                if self._running: log.error(TAG, f"Playback error: {e}")
                 break
-        log.log(TAG, f"Playback loop stopped (total={count})")
 
     def play_mixed_audio(self, pcm_data: bytes) -> None:
-        """将混合音频放入播放队列（由 Qt 主线程调用，非阻塞）。"""
-        if not self._running:
-            return
-        try:
-            if self._play_queue.full():
-                try:
-                    self._play_queue.get_nowait()  # 丢弃最旧的
-                except queue.Empty:
-                    pass
-            self._play_queue.put_nowait(pcm_data)
-        except queue.Full:
-            pass
-        # 诊断计数
-        if not hasattr(self, '_recv_count'):
-            self._recv_count = 0
-        self._recv_count += 1
-        if self._recv_count % 50 == 1:
-            log.log(TAG, f"[RECV-FROM-HOST] pkt#{self._recv_count} len={len(pcm_data)} qsize={self._play_queue.qsize()}")
+        """网络接收线程调用：将音频推入抖动缓冲区"""
+        if not self._running: return
+        self.rx_pipeline.push(pcm_data)
