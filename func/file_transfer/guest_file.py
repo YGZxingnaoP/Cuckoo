@@ -237,6 +237,7 @@ class GuestFileSender:
     def __init__(self, client_conn, task_dict=None):
         self._client_conn = client_conn
         self._resume_event = threading.Event()
+        self._on_failed = None
         
         if task_dict:
             self._current_task = task_dict
@@ -288,12 +289,17 @@ class GuestFileSender:
         self._resume_event.clear()
         meta_payload = json.dumps(task).encode("utf-8")
         self._client_conn.send_frame(MSG_FILE_TASK_META, target_id, meta_payload)
-        threading.Thread(target=self._wait_and_send, args=(target_id,), daemon=True).start()
+        log.log(TAG, f"Guest file send started: task_id={self.task_id}, target={target_id}, files={len(task['files'])}")
+        threading.Thread(target=self._wait_and_send, args=(target_id,), daemon=True, name=f"GuestFileSender-{self.task_id}").start()
 
     def _wait_and_send(self, target_id):
         if self._resume_event.wait(timeout=60):
             self._client_conn.send_frame(MSG_FILE_RESUME_ACK, target_id, b"\x00")
             self._send_chunks(target_id)
+        else:
+            log.error(TAG, f"Guest file send timeout: task_id={self.task_id}, no resume response within 60s")
+            if self._on_failed:
+                self._on_failed(f"文件发送失败：对方未响应（超时60秒）")
 
     def handle_resume_req(self, payload):
         try:

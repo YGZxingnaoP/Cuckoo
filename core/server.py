@@ -13,7 +13,8 @@ from typing import Optional, Callable
 from common import logger as log
 from core.protocol import (
     build_frame, read_frame, BROADCAST_ID, HOST_ID,
-    MSG_TEXT, MSG_FILE_META, MSG_FILE_CHUNK, MSG_SCREEN_FRAME, MSG_COMMAND, MSG_VOICE,
+    MSG_TEXT, MSG_FILE_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
+    MSG_FILE_TASK_META, MSG_FILE_CHUNK, MSG_SCREEN_FRAME, MSG_COMMAND, MSG_VOICE,
     CMD_JOIN, CMD_JOIN_ACK, CMD_LEAVE, CMD_USER_LIST
 )
 import config
@@ -338,7 +339,8 @@ class Server:
 
         if msg_type == MSG_SCREEN_FRAME:
             target_q, can_drop = info.media_queue, True
-        elif msg_type in (MSG_FILE_META, MSG_FILE_CHUNK):
+        elif msg_type in (MSG_FILE_META, MSG_FILE_CHUNK, MSG_FILE_TASK_META,
+                          MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK):
             target_q, can_drop = info.file_queue, False
         else:
             target_q, can_drop = info.priority_queue, True

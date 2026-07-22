@@ -27,6 +27,7 @@ class HostFileHandler(QObject):
     progress = Signal(str, int, str, str)
     file_complete = Signal(str, str)
     status_changed = Signal(str)
+    send_failed = Signal(str)  # 发送失败通知 UI
 
     def __init__(self, server: Server):
         super().__init__()
@@ -77,6 +78,7 @@ class HostFileHandler(QObject):
 
     def send_file(self, file_path: str, target_id: int):
         sender = HostFileSender(self._server, [file_path], target_id, HOST_ID, False)
+        sender.set_on_failed_callback(lambda msg: self.send_failed.emit(msg))
         self.register_sender(sender)
         sender.start()
 
@@ -85,8 +87,16 @@ class HostFileHandler(QObject):
         for root, _, files in os.walk(folder_path):
             for f in files: file_list.append(os.path.join(root, f))
         sender = HostFileSender(self._server, file_list, target_id, HOST_ID, True, os.path.basename(folder_path), folder_path)
+        sender.set_on_failed_callback(lambda msg: self.send_failed.emit(msg))
         self.register_sender(sender)
         sender.start()
+
+    def cleanup(self):
+        """清理所有发送任务。"""
+        with self._lock:
+            for sender in self._senders.values():
+                sender.cancel()
+            self._senders.clear()
 
 
 class HostFileSender:
@@ -94,6 +104,8 @@ class HostFileSender:
     def __init__(self, server, abs_paths=None, target_id=0, sender_id=0, is_folder=False, base_name="", root_path="", task_dict=None):
         self._server = server
         self._resume_event = threading.Event()
+        self._cancelled = False
+        self._on_failed = None
         
         if task_dict:
             self._task = task_dict
@@ -115,6 +127,13 @@ class HostFileSender:
                 })
             self._task = {"task_id": self.task_id, "sender_id": sender_id, "target_id": target_id, "is_folder": is_folder, "base_name": base_name, "files": self._files}
 
+    def set_on_failed_callback(self, callback):
+        self._on_failed = callback
+
+    def cancel(self):
+        self._cancelled = True
+        self._resume_event.set()
+
     @classmethod
     def from_json(cls, server, task_dict):
         return cls(server, task_dict=task_dict)
@@ -123,13 +142,19 @@ class HostFileSender:
         meta_payload = json.dumps(self._task).encode("utf-8")
         meta_frame = build_frame(MSG_FILE_TASK_META, HOST_ID, self._target_id, meta_payload)
         self._server.send_to(self._target_id, meta_frame, MSG_FILE_TASK_META)
-        threading.Thread(target=self._wait_and_send, daemon=True).start()
+        log.log(TAG, f"File send started: task_id={self.task_id}, target={self._target_id}, files={len(self._files)}")
+        threading.Thread(target=self._wait_and_send, daemon=True, name=f"FileSender-{self.task_id}").start()
 
     def _wait_and_send(self):
         if self._resume_event.wait(timeout=60):
+            if self._cancelled: return
             ack_frame = build_frame(MSG_FILE_RESUME_ACK, HOST_ID, self._target_id, b"\x00")
             self._server.send_to(self._target_id, ack_frame, MSG_FILE_RESUME_ACK)
             self._send_chunks()
+        else:
+            log.error(TAG, f"File send timeout: task_id={self.task_id}, no resume response within 60s")
+            if self._on_failed:
+                self._on_failed(f"文件发送失败：对方未响应（超时60秒）")
 
     def handle_resume_req(self, payload):
         try:

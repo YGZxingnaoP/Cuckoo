@@ -72,6 +72,7 @@ class MainWindow(QMainWindow):
     _online_users_changed = Signal(dict)  # 在线用户列表变更 {uid: nickname}
     _voice_data_received = Signal(bytes)  # 语音独立 TCP 接收到的混合音频
     _mic_error_signal = Signal(str)  # 麦克风启动失败（从后台线程发出）
+    _guest_send_failed = Signal(str)  # 房客文件发送失败
 
     # 房主断开连接信号（房客端专用）
     host_disconnected = Signal()
@@ -222,6 +223,9 @@ class MainWindow(QMainWindow):
         # 麦克风错误信号（从后台线程发出）
         self._mic_error_signal.connect(self._on_mic_error)
 
+        # 房客文件发送失败信号
+        self._guest_send_failed.connect(self._on_file_send_failed)
+
         # 在线面板定时刷新定时器（保底机制，防止信号丢失）
         self._online_refresh_timer = QTimer(self)
         self._online_refresh_timer.setInterval(3000)  # 每 3 秒
@@ -274,6 +278,7 @@ class MainWindow(QMainWindow):
             self._host_file.progress.connect(self._file_tab.update_progress)
             self._host_file.file_complete.connect(self._on_file_complete)
             self._host_file.status_changed.connect(self._file_tab.set_status)
+            self._host_file.send_failed.connect(self._on_file_send_failed)
 
             # 启动服务器
             self._server.start()
@@ -740,6 +745,7 @@ class MainWindow(QMainWindow):
             if not self._guest_file_sender:
                 from func.file_transfer.guest_file import GuestFileSender
                 self._guest_file_sender = GuestFileSender(self._client)
+                self._guest_file_sender._on_failed = lambda msg: self._guest_send_failed.emit(msg)
             self._guest_file_sender.send_file(file_path, target_id, self._my_id)
 
     def _on_folder_send(self, folder_path: str, target_id: int) -> None:
@@ -749,6 +755,7 @@ class MainWindow(QMainWindow):
             if not self._guest_file_sender:
                 from func.file_transfer.guest_file import GuestFileSender
                 self._guest_file_sender = GuestFileSender(self._client)
+                self._guest_file_sender._on_failed = lambda msg: self._guest_send_failed.emit(msg)
             self._guest_file_sender.send_folder(folder_path, target_id, self._my_id)
 
     def _on_resume_requested(self, task_id: str):
@@ -761,6 +768,11 @@ class MainWindow(QMainWindow):
 
     def _on_file_complete(self, path: str) -> None:
         self._file_tab.set_status(f"接收完成: {os.path.basename(path)}")
+
+    def _on_file_send_failed(self, error_msg: str) -> None:
+        """文件发送失败回调（从后台线程通过信号安全到达主线程）。"""
+        self._file_tab.set_status(error_msg)
+        QMessageBox.warning(self, "发送失败", error_msg)
 
     def _on_probe(self) -> None:
         """房客探测房主在线状态。"""
