@@ -104,12 +104,12 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self._tabs, stretch=1)
         self.setCentralWidget(central)
 
-        self._btn_expand_panel = QPushButton("☰")
+        self._btn_expand_panel = QPushButton("三")
         self._btn_expand_panel.setParent(self._tabs)
         self._btn_expand_panel.setFixedSize(24, 24)
         self._btn_expand_panel.move(2, 2)
         self._btn_expand_panel.raise_()
-        self._btn_expand_panel.setStyleSheet("QPushButton { font-size: 12px; padding: 0; border: none; background: transparent; color: #666; } QPushButton:hover { color: #ccc; background: #333; border-radius: 3px; }")
+        self._btn_expand_panel.setStyleSheet("QPushButton { font-size: 12px; padding: 0; border: none; background: transparent; color: #888; } QPushButton:hover { color: #f0f0f0; background: #1a1a1a; border-radius: 3px; }")
         self._btn_expand_panel.setToolTip("展开在线列表")
         self._btn_expand_panel.clicked.connect(self._online_panel.toggle_collapse)
         self._btn_expand_panel.hide()
@@ -164,9 +164,18 @@ class MainWindow(QMainWindow):
         self._file_manager = UnifiedFileTransfer(self._my_id, send_callback)
         self._file_manager.progress.connect(self._file_tab.update_progress)
         self._file_manager.file_complete.connect(self._on_file_complete)
-        self._file_manager.status_changed.connect(self._file_tab.set_status)
+        self._file_manager.status_changed.connect(self._on_file_status_changed)
         self._file_manager.task_interrupted.connect(self._file_tab.add_interrupted_task)
         self._file_manager.task_removed.connect(self._file_tab.remove_interrupted_task)
+
+    def _on_file_status_changed(self, status: str):
+        self._file_tab.set_status(status)
+        # 【体验优化】：房客接收文件时，暂停解码渲染防止卡顿
+        if status.startswith("正在接收"):
+            if not self._is_host and self._screen_tab._streaming:
+                self._screen_tab.stop_streaming()
+                if self._screen_guest: self._screen_guest.stop()
+                self._chat_tab.append_system("正在接收文件，已自动暂停投屏渲染")
 
     # ═════════════════════════════════════════
     # 房主服务
@@ -309,8 +318,19 @@ class MainWindow(QMainWindow):
     # ═════════════════════════════════════════
     def _on_frame_received(self, msg_type: int, sender_id: int, target_id: int, payload: bytes) -> None:
         if msg_type == MSG_TEXT: self._handle_text_guest(sender_id, payload)
+        elif msg_type == MSG_COMMAND and len(payload) > 0:
+            cmd = payload[0]
+            if cmd == CMD_SCREEN_STOP:
+                if self._screen_guest:
+                    self._screen_guest.stop()
+                    self._screen_tab.stop_streaming()
+            elif cmd == CMD_SCREEN_START:
+                if self._screen_guest:
+                    self._screen_tab.start_streaming()
+                    self._screen_guest.start()
         elif msg_type == MSG_SCREEN_FRAME:
-            if self._screen_guest: self._screen_guest.push_frame_data(payload)
+            if self._screen_guest and self._screen_tab._streaming:
+                self._screen_guest.push_frame_data(payload)
         elif msg_type in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK):
             if self._file_manager: self._file_manager.handle_incoming(msg_type, sender_id, payload)
 
@@ -346,9 +366,16 @@ class MainWindow(QMainWindow):
     # 文件操作槽
     # ═════════════════════════════════════════
     def _on_file_send(self, file_path: str, target_id: int) -> None:
+        # 【体验优化】：发送文件时，如果是房主且正在投屏，自动暂停
+        if self._is_host and self._screen_host and self._screen_host.running:
+            self._on_toggle_screen()
+            self._chat_tab.append_system("为保证传输速度，已自动暂停投屏")
         if self._file_manager: self._file_manager.send_file(file_path, target_id)
 
     def _on_folder_send(self, folder_path: str, target_id: int) -> None:
+        if self._is_host and self._screen_host and self._screen_host.running:
+            self._on_toggle_screen()
+            self._chat_tab.append_system("为保证传输速度，已自动暂停投屏")
         if self._file_manager: self._file_manager.send_folder(folder_path, target_id)
 
     def _on_resume_requested(self, task_id: str):

@@ -46,6 +46,8 @@ class ScreenGuest(QObject):
 
     def push_frame_data(self, jpeg_data: bytes) -> None:
         """接收新帧（由 MainWindow 在 frame_received 信号中调用）。"""
+        # 【关键修复】：如果已经停止，直接丢弃网络传来的残余帧
+        if not self._running: return
         with self._frame_lock:
             self._latest_frame = jpeg_data
 
@@ -72,6 +74,8 @@ class ScreenGuest(QObject):
 
     def stop(self) -> None:
         self._running = False
+        with self._frame_lock:
+            self._latest_frame = None  # 清空最后一帧内存
         if self._thread:
             self._thread.join(timeout=2)
             self._thread = None

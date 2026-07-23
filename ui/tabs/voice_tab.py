@@ -35,7 +35,7 @@ class VoiceTab(QWidget):
         self._status_label = QLabel("语音通话")
         self._status_label.setObjectName("voiceStatusLabel")
         self._status_label.setAlignment(Qt.AlignCenter)
-        self._status_label.setStyleSheet("font-size: 18px; color: #ccc;")
+        self._status_label.setStyleSheet("font-size: 18px; color: #f0f0f0;")
         layout.addWidget(self._status_label)
 
         layout.addSpacing(20)
@@ -98,7 +98,7 @@ class VoiceTab(QWidget):
         gain_layout.addLayout(slider_row)
 
         hint_label = QLabel("拖动滑块调节：50% 降低音量，100% 原始，300% 最大增幅")
-        hint_label.setStyleSheet("color: #999; font-size: 11px;")
+        hint_label.setStyleSheet("color: #888888; font-size: 11px;")
         hint_label.setAlignment(Qt.AlignCenter)
         gain_layout.addWidget(hint_label)
 

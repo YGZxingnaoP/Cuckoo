@@ -33,8 +33,8 @@ class FileTab(QWidget):
         target_frame.setObjectName("targetFrame")
         target_frame.setStyleSheet("""
             QFrame#targetFrame {
-                background-color: #313244;
-                border: 1px solid #45475a;
+                background-color: #141414;
+                border: 1px solid #2a2a2a;
                 border-radius: 8px;
                 padding: 12px;
             }
@@ -43,12 +43,12 @@ class FileTab(QWidget):
         target_layout.setContentsMargins(12, 8, 12, 8)
         
         self._target_label = QLabel("发送给：")
-        self._target_label.setStyleSheet("color: #a6adc8; font-weight: bold; background: transparent; border: none;")
+        self._target_label.setStyleSheet("color: #888888; font-weight: bold; background: transparent; border: none;")
         target_layout.addWidget(self._target_label)
         
         self._target_combo = QComboBox()
         self._target_combo.setMinimumWidth(200)
-        self._target_combo.setStyleSheet("background-color: #1e1e2e; border: 1px solid #45475a; border-radius: 4px; padding: 4px;")
+        self._target_combo.setStyleSheet("background-color: #0a0a0a; border: 1px solid #2a2a2a; border-radius: 4px; padding: 4px;")
         target_layout.addWidget(self._target_combo, stretch=1)
         layout.addWidget(target_frame)
 
@@ -57,8 +57,8 @@ class FileTab(QWidget):
         status_frame.setObjectName("statusFrame")
         status_frame.setStyleSheet("""
             QFrame#statusFrame {
-                background-color: #181825;
-                border: 1px solid #313244;
+                background-color: #0f0f0f;
+                border: 1px solid #2a2a2a;
                 border-radius: 8px;
                 padding: 12px;
             }
@@ -67,7 +67,7 @@ class FileTab(QWidget):
         status_layout.setSpacing(8)
         
         self._file_label = QLabel("未选择文件")
-        self._file_label.setStyleSheet("color: #cdd6f4; font-size: 13px; background: transparent; border: none;")
+        self._file_label.setStyleSheet("color: #f0f0f0; font-size: 13px; background: transparent; border: none;")
         self._file_label.setWordWrap(True)
         status_layout.addWidget(self._file_label)
         
@@ -81,9 +81,9 @@ class FileTab(QWidget):
         
         info_layout = QHBoxLayout()
         self._speed_label = QLabel("速度：--")
-        self._speed_label.setStyleSheet("color: #a6adc8; font-size: 12px; background: transparent; border: none;")
+        self._speed_label.setStyleSheet("color: #888888; font-size: 12px; background: transparent; border: none;")
         self._eta_label = QLabel("剩余：--")
-        self._eta_label.setStyleSheet("color: #a6adc8; font-size: 12px; background: transparent; border: none;")
+        self._eta_label.setStyleSheet("color: #888888; font-size: 12px; background: transparent; border: none;")
         info_layout.addWidget(self._speed_label)
         info_layout.addStretch()
         info_layout.addWidget(self._eta_label)
@@ -95,40 +95,40 @@ class FileTab(QWidget):
         btn_layout = QGridLayout()
         btn_layout.setSpacing(12)
         
-        self._btn_select = QPushButton("📄  选择文件并发送")
+        self._btn_select = QPushButton("选择文件并发送")
         self._btn_select.setObjectName("btnAction")
         self._btn_select.setMinimumHeight(48)
         self._btn_select.setStyleSheet("""
             QPushButton#btnAction {
-                background-color: #89b4fa;
-                color: #1e1e2e;
+                background-color: #f0f0f0;
+                color: #0a0a0a;
                 font-weight: bold;
                 font-size: 14px;
                 border: none;
                 border-radius: 8px;
                 padding: 10px;
             }
-            QPushButton#btnAction:hover { background-color: #b4befe; }
-            QPushButton#btnAction:pressed { background-color: #74c7ec; }
+            QPushButton#btnAction:hover { background-color: #ffffff; }
+            QPushButton#btnAction:pressed { background-color: #cccccc; }
         """)
         self._btn_select.clicked.connect(self._on_select_file)
         btn_layout.addWidget(self._btn_select, 0, 0)
 
-        self._btn_folder = QPushButton("📁  选择文件夹并发送")
+        self._btn_folder = QPushButton("选择文件夹并发送")
         self._btn_folder.setObjectName("btnActionSecondary")
         self._btn_folder.setMinimumHeight(48)
         self._btn_folder.setStyleSheet("""
             QPushButton#btnActionSecondary {
-                background-color: #45475a;
-                color: #cdd6f4;
+                background-color: #1a1a1a;
+                color: #f0f0f0;
                 font-weight: bold;
                 font-size: 14px;
-                border: 1px solid #585b70;
+                border: 1px solid #2a2a2a;
                 border-radius: 8px;
                 padding: 10px;
             }
-            QPushButton#btnActionSecondary:hover { background-color: #585b70; border: 1px solid #6c7086; }
-            QPushButton#btnActionSecondary:pressed { background-color: #313244; }
+            QPushButton#btnActionSecondary:hover { background-color: #2a2a2a; border: 1px solid #3a3a3a; }
+            QPushButton#btnActionSecondary:pressed { background-color: #141414; }
         """)
         self._btn_folder.clicked.connect(self._on_select_folder)
         btn_layout.addWidget(self._btn_folder, 0, 1)
@@ -136,16 +136,16 @@ class FileTab(QWidget):
         layout.addLayout(btn_layout)
 
         # ── 4. 断点续传区 ──
-        self._interrupt_group = QGroupBox("⏸ 中断的传输任务 (断点续传)")
+        self._interrupt_group = QGroupBox("中断的传输任务 (断点续传)")
         self._interrupt_group.setStyleSheet("""
             QGroupBox {
                 font-weight: bold;
-                color: #f9e2af;
-                border: 1px solid #45475a;
+                color: #f0f0f0;
+                border: 1px solid #2a2a2a;
                 border-radius: 8px;
                 margin-top: 12px;
                 padding-top: 16px;
-                background-color: #181825;
+                background-color: #0f0f0f;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
@@ -160,40 +160,40 @@ class FileTab(QWidget):
         self._interrupt_list.setMaximumHeight(120)
         self._interrupt_list.setStyleSheet("""
             QListWidget {
-                background-color: #1e1e2e;
-                border: 1px solid #313244;
+                background-color: #0a0a0a;
+                border: 1px solid #2a2a2a;
                 border-radius: 6px;
-                color: #cdd6f4;
+                color: #f0f0f0;
                 outline: none;
             }
             QListWidget::item { padding: 6px 10px; border-radius: 4px; }
-            QListWidget::item:selected { background-color: #45475a; color: #f9e2af; }
+            QListWidget::item:selected { background-color: #2a2a2a; color: #f0f0f0; }
         """)
         int_layout.addWidget(self._interrupt_list)
         
         int_btn_layout = QHBoxLayout()
         int_btn_layout.setSpacing(10)
         
-        self._btn_resume = QPushButton("▶ 继续传输")
+        self._btn_resume = QPushButton("继续传输")
         self._btn_resume.setMinimumHeight(36)
         self._btn_resume.setStyleSheet("""
             QPushButton {
-                background-color: #a6e3a1; color: #1e1e2e; font-weight: bold;
+                background-color: #f0f0f0; color: #0a0a0a; font-weight: bold;
                 border: none; border-radius: 6px; padding: 6px 16px;
             }
-            QPushButton:hover { background-color: #94e2d5; }
+            QPushButton:hover { background-color: #ffffff; }
         """)
         self._btn_resume.clicked.connect(self._on_resume)
         int_btn_layout.addWidget(self._btn_resume)
         
-        self._btn_clear = QPushButton("✕ 清除任务")
+        self._btn_clear = QPushButton("清除任务")
         self._btn_clear.setMinimumHeight(36)
         self._btn_clear.setStyleSheet("""
             QPushButton {
-                background-color: #f38ba8; color: #1e1e2e; font-weight: bold;
+                background-color: #2a2a2a; color: #f0f0f0; font-weight: bold;
                 border: none; border-radius: 6px; padding: 6px 16px;
             }
-            QPushButton:hover { background-color: #eba0ac; }
+            QPushButton:hover { background-color: #3a3a3a; }
         """)
         self._btn_clear.clicked.connect(self._on_clear)
         int_btn_layout.addWidget(self._btn_clear)

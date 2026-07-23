@@ -38,7 +38,8 @@ class ClientConnection(QObject):
         self._my_id: int = -1
         self._sock: Optional[socket.socket] = None
         self._running = False
-        self._send_queue: queue.Queue = queue.Queue(maxsize=config.SEND_QUEUE_MAX * 3)
+        self._priority_queue: queue.Queue = queue.Queue(maxsize=config.SEND_QUEUE_MAX * 3)  # 信令与文件
+        self._media_queue: queue.Queue = queue.Queue(maxsize=config.SEND_QUEUE_MAX)          # 投屏帧
         self._receiver_thread: Optional[threading.Thread] = None
         self._sender_thread: Optional[threading.Thread] = None
         self._disconnected_emitted = False
@@ -66,7 +67,7 @@ class ClientConnection(QObject):
 
         join_data = bytes([CMD_JOIN]) + self._nickname.encode("utf-8")
         join_frame = build_frame(MSG_COMMAND, 0, HOST_ID, join_data)
-        self._send_queue.put(join_frame)
+        self._priority_queue.put(join_frame)
 
     def _recv_loop(self) -> None:
         log.log(TAG, "Receiver thread started")
@@ -114,11 +115,31 @@ class ClientConnection(QObject):
     def _send_loop(self) -> None:
         log.log(TAG, "Sender thread started")
         while self._running:
+            frame_bytes = None
             try:
-                frame_bytes = self._send_queue.get(timeout=1.0)
-                if frame_bytes is None: break
+                # 1. 最高优先级：信令与文件（阻塞获取，绝不丢弃）
+                try:
+                    frame_bytes = self._priority_queue.get_nowait()
+                except queue.Empty:
+                    pass
+
+                # 2. 最低优先级：投屏帧（清空旧帧，只发最新）
+                if frame_bytes is None:
+                    try:
+                        while True:
+                            frame_bytes = self._media_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+
+                # 3. 如果都没有，阻塞等待信令队列
+                if frame_bytes is None:
+                    try:
+                        frame_bytes = self._priority_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+
+                if frame_bytes is False: break
                 self._sock.sendall(frame_bytes)
-            except queue.Empty: continue
             except (ConnectionError, OSError) as e:
                 log.error(TAG, f"Send error: {e}")
                 break
@@ -147,29 +168,27 @@ class ClientConnection(QObject):
         self.user_list.emit(list(users.items()))
 
     def send_frame(self, msg_type: int, target_id: int, payload: bytes = b"") -> None:
-        """构建并发送一帧。控制信令带超时入队，数据块非阻塞入队。"""
+        """构建并发送一帧。信令/文件走优先级队列，投屏帧走媒体队列。"""
         frame = build_frame(msg_type, self._my_id, target_id, payload)
-        
-        # 【致命Bug修复】：控制信令必须可靠送达，使用带超时的阻塞入队（防止网络死锁卡死UI）
-        if msg_type in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_TEXT, MSG_COMMAND):
+
+        if msg_type == MSG_SCREEN_FRAME:
+            # 投屏帧：非阻塞，满了就丢弃旧的
             try:
-                self._send_queue.put(frame, timeout=5.0)
-            except queue.Full:
-                log.warn(TAG, f"Send queue full, dropping control frame: {msg_type}")
+                if self._media_queue.full():
+                    self._media_queue.get_nowait()
+                self._media_queue.put_nowait(frame)
+            except (queue.Empty, queue.Full):
+                pass
         else:
-            # 数据块（如文件块）使用非阻塞入队，满了丢弃旧块
+            # 文件与信令：阻塞入队，保证送达
             try:
-                self._send_queue.put_nowait(frame)
+                self._priority_queue.put(frame, timeout=5.0)
             except queue.Full:
-                try:
-                    self._send_queue.get_nowait()
-                    self._send_queue.put_nowait(frame)
-                except (queue.Empty, queue.Full):
-                    pass
+                log.warn(TAG, f"Priority queue full, dropping: {msg_type}")
 
     def stop(self) -> None:
         self._running = False
-        self._send_queue.put(None)
+        self._priority_queue.put(False)
         if self._sock:
             try: self._sock.close()
             except OSError: pass

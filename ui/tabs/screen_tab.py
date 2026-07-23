@@ -45,7 +45,7 @@ class ScreenTab(QWidget):
         self._video_label.setObjectName("videoLabel")
         self._video_label.setAlignment(Qt.AlignCenter)
         self._video_label.setMinimumSize(640, 360)
-        self._video_label.setStyleSheet("background-color: #1a1a1a; color: #888;")
+        self._video_label.setStyleSheet("background-color: #0f0f0f; color: #888888; border: 1px solid #2a2a2a; border-radius: 6px;")
         layout.addWidget(self._video_label, stretch=1)
 
         # 控制区域（仅房主）
@@ -57,9 +57,9 @@ class ScreenTab(QWidget):
             self._btn_config_toggle.setObjectName("btnConfigToggle")
             self._btn_config_toggle.setFixedWidth(120)
             self._btn_config_toggle.setStyleSheet(
-                "QPushButton { font-size: 11px; color: #aaa; background: transparent; "
-                "border: 1px solid #444; border-radius: 3px; padding: 2px 6px; }"
-                "QPushButton:hover { color: #fff; border-color: #888; }"
+                "QPushButton { font-size: 11px; color: #888; background: transparent; "
+                "border: 1px solid #2a2a2a; border-radius: 3px; padding: 2px 6px; }"
+                "QPushButton:hover { color: #f0f0f0; border-color: #888888; }"
             )
             self._btn_config_toggle.clicked.connect(self._toggle_config_visible)
             collapse_row.addWidget(self._btn_config_toggle)
@@ -121,7 +121,7 @@ class ScreenTab(QWidget):
             share_layout.addLayout(spk_row)
 
             hint = QLabel("选择要采集的扬声器设备，仅该扬声器的声音会共享给房客")
-            hint.setStyleSheet("color: #999; font-size: 10px;")
+            hint.setStyleSheet("color: #888888; font-size: 10px;")
             hint.setWordWrap(True)
             share_layout.addWidget(hint)
 

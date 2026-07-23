@@ -46,16 +46,16 @@ class OnlineListPanel(QWidget):
         top_row.setSpacing(2)
 
         self._header_label = QLabel("在线")
-        self._header_label.setStyleSheet("font-size: 11px; color: #aaa; font-weight: bold;")
+        self._header_label.setStyleSheet("font-size: 11px; color: #888; font-weight: bold;")
         top_row.addWidget(self._header_label, stretch=1)
 
         # 右上角折叠按钮（隐蔽风格）
-        self._btn_toggle = QPushButton("✕")
+        self._btn_toggle = QPushButton("X")
         self._btn_toggle.setFixedSize(20, 20)
         self._btn_toggle.setStyleSheet(
             "QPushButton { font-size: 9px; padding: 0; border: none; "
-            "background: transparent; color: #666; }"
-            "QPushButton:hover { color: #ccc; background: #333; border-radius: 3px; }"
+            "background: transparent; color: #888; }"
+            "QPushButton:hover { color: #f0f0f0; background: #1a1a1a; border-radius: 3px; }"
         )
         self._btn_toggle.setToolTip("收起在线列表")
         self._btn_toggle.clicked.connect(self.toggle_collapse)
@@ -65,18 +65,18 @@ class OnlineListPanel(QWidget):
 
         # ── 模式标签 ──
         role_text = "房主模式" if self._is_host else "房客模式"
-        role_color = "#4a4" if self._is_host else "#48f"
+        role_color = "#f0f0f0" if self._is_host else "#888888"
         self._role_label = QLabel(role_text)
         self._role_label.setAlignment(Qt.AlignCenter)
         self._role_label.setStyleSheet(
             f"font-size: 13px; font-weight: bold; color: {role_color}; "
-            f"padding: 4px; background: #222; border-radius: 4px;"
+            f"padding: 4px; background: #141414; border: 1px solid #2a2a2a; border-radius: 4px;"
         )
         self._main_layout.addWidget(self._role_label)
 
         # ── 在线列表标题 ──
         self._title_label = QLabel("在线用户")
-        self._title_label.setStyleSheet("font-size: 11px; color: #999;")
+        self._title_label.setStyleSheet("font-size: 11px; color: #888;")
         self._title_label.setAlignment(Qt.AlignCenter)
         self._main_layout.addWidget(self._title_label)
 
@@ -84,8 +84,9 @@ class OnlineListPanel(QWidget):
         self._user_list = QListWidget()
         self._user_list.setObjectName("onlineUserList")
         self._user_list.setStyleSheet(
-            "QListWidget { font-size: 13px; } "
-            "QListWidget::item { padding: 4px 8px; }"
+            "QListWidget { font-size: 13px; background-color: #0f0f0f; border: 1px solid #2a2a2a; } "
+            "QListWidget::item { padding: 4px 8px; color: #f0f0f0; }"
+            "QListWidget::item:selected { background-color: #2a2a2a; }"
         )
         self._main_layout.addWidget(self._user_list, stretch=1)
 
@@ -147,9 +148,9 @@ class OnlineListPanel(QWidget):
         """更新角色显示。"""
         self._is_host = is_host
         role_text = "房主模式" if is_host else "房客模式"
-        role_color = "#4a4" if is_host else "#48f"
+        role_color = "#f0f0f0" if is_host else "#888888"
         self._role_label.setText(role_text)
         self._role_label.setStyleSheet(
             f"font-size: 13px; font-weight: bold; color: {role_color}; "
-            f"padding: 4px; background: #222; border-radius: 4px;"
+            f"padding: 4px; background: #141414; border: 1px solid #2a2a2a; border-radius: 4px;"
         )

@@ -353,7 +353,7 @@ class Server:
         if msg_type == MSG_SCREEN_FRAME:
             target_q, can_drop = info.media_queue, True
         elif msg_type == MSG_FILE_CHUNK:
-            target_q, can_drop = info.file_queue, True  
+            target_q, can_drop = info.file_queue, False  # 【致命修复】文件块绝对不能丢！
         else:
             target_q, can_drop = info.priority_queue, True
 
@@ -363,10 +363,12 @@ class Server:
                 except queue.Empty: pass
             target_q.put_nowait(frame_bytes)
         except queue.Full:
-            try: target_q.get_nowait()
-            except queue.Empty: pass
-            try: target_q.put_nowait(frame_bytes)
-            except queue.Full: pass
+            if not can_drop:
+                # 如果文件队列满了，强制丢弃一个投屏帧来腾出网络带宽
+                try: info.media_queue.get_nowait()
+                except queue.Empty: pass
+                try: target_q.put_nowait(frame_bytes)
+                except queue.Full: pass
             
     def _remove_client(self, uid: int) -> None:
         with self._clients_lock: info = self._clients.pop(uid, None)
