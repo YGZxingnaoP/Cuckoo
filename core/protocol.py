@@ -19,6 +19,8 @@ MSG_VOICE: int = 0x06
 MSG_FILE_RESUME_REQ: int = 0x07  # 接收方请求续传 (Payload: JSON)
 MSG_FILE_RESUME_ACK: int = 0x08  # 发送方确认续传 (Payload: 1B status)
 MSG_FILE_TASK_META: int = 0x09   # 文件夹/断点续传任务元数据 (Payload: JSON)
+MSG_FILE_CHUNK_ACK: int = 0x0A   # 【新增】接收方chunk确认 (Payload: binary)
+MSG_CINEMA_CMD: int = 0x0B       # 【新增】电影院控制命令 (Payload: binary)
 
 # ─────────────────────────────────────────────
 # 控制命令子类型
@@ -30,6 +32,19 @@ CMD_USER_LIST: int = 0x04
 CMD_SCREEN_START: int = 0x10   
 CMD_SCREEN_STOP: int = 0x11    
 CMD_CHAT_BROADCAST: int = 0x20 
+
+# ─────────────────────────────────────────────
+# 电影院控制命令子类型
+# ─────────────────────────────────────────────
+CINEMA_JOIN: int = 0x30          # 房客加入观影
+CINEMA_LEAVE: int = 0x31         # 房客离开观影  
+CINEMA_PLAY: int = 0x32          # 播放
+CINEMA_PAUSE: int = 0x33         # 暂停
+CINEMA_SEEK: int = 0x34          # 跳转(房主专用, payload: milliseconds int64)
+CINEMA_SYNC: int = 0x35          # 同步广播(当前位置+状态)
+CINEMA_STOP: int = 0x36          # 停止观影
+CINEMA_CHANGE: int = 0x37        # 切换电影 (payload: filename UTF-8)
+CINEMA_SYNC_REQ: int = 0x38      # 房客请求同步（中途加入）
 
 # ─────────────────────────────────────────────
 # ID 约定

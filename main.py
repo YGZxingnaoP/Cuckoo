@@ -89,10 +89,47 @@ QSlider::handle:horizontal:hover { background: #ffffff; border: 1px solid #fffff
 """
 
 
+def _init_vlc_path() -> None:
+    """
+    初始化 VLC 运行时路径，确保打包后也能找到 libvlc.dll 和 plugins。
+    开发模式：runtime/ 目录下的 VLC 文件
+    打包模式：sys._MEIPASS/vlc/ 下的 VLC 文件
+    """
+    if getattr(sys, 'frozen', False):
+        vlc_dir = os.path.join(sys._MEIPASS, "vlc")
+    else:
+        vlc_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime")
+
+    vlc_plugins = os.path.join(vlc_dir, "plugins")
+
+    if not os.path.isdir(vlc_plugins):
+        return  # VLC 未打包，回退到系统安装的 VLC
+
+    # 1. add_dll_directory (Python 3.8+ / Windows 10 1809+)
+    try:
+        os.add_dll_directory(vlc_dir)
+    except AttributeError:
+        pass
+
+    # 2. PATH 兜底（兼容所有 Windows 版本）
+    os.environ["PATH"] = vlc_dir + os.pathsep + os.environ.get("PATH", "")
+
+    # 3. VLC 插件路径
+    os.environ["VLC_PLUGIN_PATH"] = vlc_plugins
+
+
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("Cuckoo")
     app.setStyle("Fusion")
+
+    # ── VLC 运行时路径初始化 ──
+    _init_vlc_path()
+
+    # ── 确保必要目录存在 ──
+    import config
+    os.makedirs(config.DOWNLOAD_DIR, exist_ok=True)
+    os.makedirs(config.MOVIES_DIR, exist_ok=True)
 
     # ── 设置程序图标 ──
     icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")

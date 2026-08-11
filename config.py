@@ -54,13 +54,15 @@ MIX_INTERVAL: float = 0.032   # 混音时间片（秒）→ 32ms
 # ─────────────────────────────────────────────
 FILE_CHUNK_SIZE: int = 65536  # 64KB 每块（星型拓扑推荐）
 FILE_SEND_DELAY: float = 0.001  # 每块发送间隔(秒)，防止占满带宽
+FILE_QUEUE_MAX: int = 2000     # 每客户端文件块队列上限（增大缓冲区，配合阻塞put）
+FILE_ACK_INTERVAL: int = 32    # 每收多少个chunk发送一次ACK
+FILE_ACK_TIMEOUT: float = 5.0  # ACK等待超时(秒)
 
 # ─────────────────────────────────────────────
 # 服务端参数
 # ─────────────────────────────────────────────
 MAX_CLIENTS: int = 9          # 最大房客数（ID 1-9）
 SEND_QUEUE_MAX: int = 100      # 每客户端信令/投屏队列上限（超过丢旧投屏帧）
-FILE_QUEUE_MAX: int = 1000     # 每客户端文件块队列上限（严格FIFO，不丢弃）
 ACCEPT_TIMEOUT: int = 300     # Accept 线程超时（秒）
 
 # ─────────────────────────────────────────────
@@ -86,3 +88,10 @@ else:
     _BASE_DIR = _os.path.dirname(_os.path.abspath(__file__))
 
 DOWNLOAD_DIR: str = _os.path.join(_BASE_DIR, "downloads")
+
+# ─────────────────────────────────────────────
+# 电影院参数
+# ─────────────────────────────────────────────
+MOVIES_DIR: str = _os.path.join(_BASE_DIR, "movies")
+CINEMA_SYNC_INTERVAL: float = 5.0    # 同步广播间隔（秒）
+CINEMA_SYNC_THRESHOLD: float = 0.1   # 偏差阈值（秒），超过此值才seek校正

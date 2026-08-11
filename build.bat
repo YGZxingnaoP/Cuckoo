@@ -19,19 +19,27 @@ echo [2/3] 正在打包程序 (将 Radmin 安装包注入 EXE 内部)...
 echo.
 
 :: 2. 使用 PyInstaller 打包
-:: 【关键】--add-data="Radmin;Radmin" 将安装包打入 EXE 内部
+:: 【关键】--add-data="Radmin;Radmin"           将安装包打入 EXE 内部
+:: 【关键】--add-data="runtime/vlc;vlc"         将 VLC 运行时打入 EXE 内部
 :: 【关键】--hidden-import 防止语音/投屏模块在打包后报 ModuleNotFoundError
 .\runtime\python.exe -m PyInstaller --noconfirm --onefile --windowed ^
     --icon=icon.png ^
     --name="Cuckoo" ^
     --add-data="icon.png;." ^
     --add-data="Radmin;Radmin" ^
+    --add-data="runtime/libvlc.dll;vlc" ^
+    --add-data="runtime/libvlccore.dll;vlc" ^
+    --add-data="runtime/plugins;vlc/plugins" ^
     --hidden-import=soundcard ^
     --hidden-import=soundcard._soundcard ^
     --hidden-import=mss ^
     --hidden-import=cv2 ^
     --hidden-import=numpy ^
     --hidden-import=pyaudio ^
+    --hidden-import=vlc ^
+    --hidden-import=func.cinema ^
+    --hidden-import=func.cinema.cinema_host ^
+    --hidden-import=func.cinema.cinema_guest ^
     main.py
 
 echo.

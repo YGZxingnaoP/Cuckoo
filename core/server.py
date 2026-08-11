@@ -14,7 +14,8 @@ from common import logger as log
 from core.protocol import (
     build_frame, read_frame, BROADCAST_ID, HOST_ID,
     MSG_TEXT, MSG_FILE_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
-    MSG_FILE_TASK_META, MSG_FILE_CHUNK, MSG_SCREEN_FRAME, MSG_COMMAND, MSG_VOICE,
+    MSG_FILE_TASK_META, MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK, MSG_SCREEN_FRAME,
+    MSG_COMMAND, MSG_VOICE, MSG_CINEMA_CMD,
     CMD_JOIN, CMD_JOIN_ACK, CMD_LEAVE, CMD_USER_LIST
 )
 import config
@@ -353,7 +354,11 @@ class Server:
         if msg_type == MSG_SCREEN_FRAME:
             target_q, can_drop = info.media_queue, True
         elif msg_type == MSG_FILE_CHUNK:
-            target_q, can_drop = info.file_queue, False  # 【致命修复】文件块绝对不能丢！
+            target_q, can_drop = info.file_queue, False
+        elif msg_type in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK_ACK):
+            target_q, can_drop = info.file_queue, False
+        elif msg_type == MSG_CINEMA_CMD:
+            target_q, can_drop = info.priority_queue, False  # 电影院命令不可丢弃
         else:
             target_q, can_drop = info.priority_queue, True
 
@@ -361,14 +366,20 @@ class Server:
             if can_drop and target_q.full():
                 try: target_q.get_nowait()
                 except queue.Empty: pass
-            target_q.put_nowait(frame_bytes)
+            if not can_drop:
+                # 【P0修复】文件块采用阻塞put，让TCP背压自然流控，绝不丢弃
+                target_q.put(frame_bytes, timeout=30.0)
+            else:
+                target_q.put_nowait(frame_bytes)
         except queue.Full:
             if not can_drop:
-                # 如果文件队列满了，强制丢弃一个投屏帧来腾出网络带宽
+                log.error(TAG, f"File queue stuck for client {uid}, dropping chunk after 30s timeout")
+                # 最后手段：丢弃投屏帧腾空间
                 try: info.media_queue.get_nowait()
                 except queue.Empty: pass
                 try: target_q.put_nowait(frame_bytes)
-                except queue.Full: pass
+                except queue.Full:
+                    log.error(TAG, f"CRITICAL: File queue still full for client {uid}, chunk lost")
             
     def _remove_client(self, uid: int) -> None:
         with self._clients_lock: info = self._clients.pop(uid, None)

@@ -17,13 +17,17 @@ from core.client import ClientConnection
 from core.protocol import (
     NicknameRegistry, MSG_TEXT, MSG_SCREEN_FRAME, MSG_COMMAND, MSG_VOICE,
     CMD_SCREEN_START, CMD_SCREEN_STOP, HOST_ID, BROADCAST_ID, build_frame,
-    MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK
+    MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK,
+    MSG_FILE_CHUNK_ACK, MSG_CINEMA_CMD,
+    CINEMA_PLAY, CINEMA_PAUSE, CINEMA_SEEK, CINEMA_SYNC, CINEMA_STOP,
+    CINEMA_CHANGE, CINEMA_SYNC_REQ, CINEMA_JOIN, CINEMA_LEAVE
 )
 
 from ui.tabs.screen_tab import ScreenTab
 from ui.tabs.voice_tab import VoiceTab
 from ui.tabs.file_tab import FileTab
 from ui.tabs.chat_tab import ChatTab
+from ui.tabs.cinema_tab import CinemaTab
 from ui.online_panel import OnlineListPanel
 
 from func.screen_share.host import ScreenHost
@@ -32,6 +36,8 @@ from func.voice_chat.mixer import AudioMixer
 from func.voice_chat.guest_audio import GuestAudio
 from func.voice_chat.system_audio import SystemAudioCapture
 from func.file_transfer.unified_file import UnifiedFileTransfer
+from func.cinema.cinema_host import CinemaHost
+from func.cinema.cinema_guest import CinemaGuest
 
 TAG = "MainWindow"
 
@@ -64,6 +70,8 @@ class MainWindow(QMainWindow):
         self._audio_mixer: Optional[AudioMixer] = None
         self._guest_audio: Optional[GuestAudio] = None
         self._file_manager: Optional[UnifiedFileTransfer] = None  # 【重构】统一文件管理器
+        self._cinema_host: Optional[CinemaHost] = None
+        self._cinema_guest: Optional[CinemaGuest] = None
 
         self._host_mic_running = False
         self._host_mic_thread: Optional[threading.Thread] = None
@@ -96,6 +104,8 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._voice_tab, "语音")
         self._file_tab = FileTab()
         self._tabs.addTab(self._file_tab, "文件")
+        self._cinema_tab = CinemaTab(is_host=self._is_host)
+        self._tabs.addTab(self._cinema_tab, "电影院")
         self._chat_tab = ChatTab()
         self._tabs.addTab(self._chat_tab, "文字")
 
@@ -142,6 +152,18 @@ class MainWindow(QMainWindow):
         self._online_users_changed.connect(self._online_panel.update_users)
         self._voice_tab.volume_gain_changed.connect(self._on_volume_gain_changed)
         self._voice_tab.device_changed.connect(self._on_voice_device_changed)
+        
+        # 电影院信号连接
+        self._cinema_tab.play_requested.connect(self._on_cinema_play)
+        self._cinema_tab.stop_requested.connect(self._on_cinema_stop)
+        self._cinema_tab.toggle_pause_requested.connect(self._on_cinema_toggle_pause)
+        self._cinema_tab.seek_requested.connect(self._on_cinema_seek)
+        self._cinema_tab.send_movie_requested.connect(self._on_cinema_send_movie)
+        self._cinema_tab.upload_movie_requested.connect(self._on_cinema_upload_movie)
+        self._cinema_tab.guest_join_requested.connect(self._on_cinema_guest_join)
+        self._cinema_tab.guest_leave_requested.connect(self._on_cinema_guest_leave)
+        self._cinema_tab.guest_pause_requested.connect(self._on_cinema_guest_pause)
+        self._cinema_tab.fullscreen_changed.connect(self._on_cinema_fullscreen_changed)
         
         if self._is_host:
             self._screen_tab.share_audio_toggled.connect(self._on_share_audio_toggled)
@@ -190,8 +212,10 @@ class MainWindow(QMainWindow):
             self._server.register_handler(MSG_VOICE, self._handle_voice)
             
             # 注册文件处理器 (透明中转 + 本地处理)
-            for msg_t in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK):
+            for msg_t in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK):
                 self._server.register_handler(msg_t, self._handle_file)
+            # 注册电影院处理器
+            self._server.register_handler(MSG_CINEMA_CMD, self._handle_cinema_host)
 
             self._screen_host = ScreenHost(self._server)
             self._audio_mixer = AudioMixer(send_callback=self._send_voice_to_client, output_device_index=self._host_output_device_index)
@@ -208,6 +232,13 @@ class MainWindow(QMainWindow):
                     self._server.send_to(target_id, frame, msg_type)
             
             self._init_file_manager(_host_file_cb)
+
+            # 初始化电影院（房主端）
+            def _cinema_broadcast(frame_bytes):
+                self._server.broadcast(frame_bytes, msg_type=MSG_CINEMA_CMD)
+            self._cinema_host = CinemaHost(broadcast_callback=_cinema_broadcast)
+            self._cinema_host.status_changed.connect(self._cinema_tab.set_status)
+            self._cinema_host.position_updated.connect(self._cinema_tab.update_position)
 
             self._server.start()
             self._my_id = HOST_ID
@@ -255,6 +286,7 @@ class MainWindow(QMainWindow):
             self._client.user_left.connect(self._on_user_left)
             self._client.frame_received.connect(self._on_frame_received)
             self._client.disconnected.connect(self._on_disconnected)
+            self._client.reconnected.connect(self._on_reconnected)
 
             self._screen_guest = ScreenGuest()
             self._screen_guest.frame_ready.connect(self._screen_tab.update_frame)
@@ -268,20 +300,41 @@ class MainWindow(QMainWindow):
             sys.exit(1)
 
     def _on_joined(self, assigned_id: int, nickname: str) -> None:
+        old_id = self._my_id
         self._my_id = assigned_id
         self._nicknames.set(assigned_id, nickname)
         self._chat_tab.setup(assigned_id, self._nicknames)
-        self._chat_tab.append_system(f"已加入房间，你的ID是 {assigned_id}")
+
+        # 重连场景：避免重复初始化
+        is_rejoin = (old_id == assigned_id and self._guest_audio is not None)
+
+        if not is_rejoin:
+            self._chat_tab.append_system(f"已加入房间，你的ID是 {assigned_id}")
+        else:
+            self._chat_tab.append_system(f"已重新加入房间，ID: {assigned_id}")
+
         self._connect_voice_tcp(assigned_id)
 
+        if self._guest_audio:
+            self._guest_audio.stop()
         self._guest_audio = GuestAudio(self._client, assigned_id, self._voice_sock,
             input_device_index=self._voice_tab.get_selected_input(), output_device_index=self._voice_tab.get_selected_output())
         self._guest_audio.open_output()
 
-        def _guest_file_cb(msg_type, target_id, payload):
-            if self._client: self._client.send_frame(msg_type, target_id, payload)
-            
-        self._init_file_manager(_guest_file_cb)
+        # 初始化电影院（房客端）—— 仅首次
+        if not self._cinema_guest:
+            def _cinema_send(msg_type, target_id, payload):
+                if self._client:
+                    self._client.send_frame(msg_type, target_id, payload)
+            self._cinema_guest = CinemaGuest(send_callback=_cinema_send)
+            self._cinema_guest.status_changed.connect(self._cinema_tab.set_status)
+            self._cinema_guest.position_updated.connect(self._cinema_tab.update_position)
+
+        if not self._file_manager:
+            def _guest_file_cb(msg_type, target_id, payload):
+                if self._client: self._client.send_frame(msg_type, target_id, payload)
+            self._init_file_manager(_guest_file_cb)
+
         self._status_bar.showMessage(f"已连接房主 — ID: {assigned_id}")
 
     def _on_user_list(self, users_list: list) -> None:
@@ -331,8 +384,10 @@ class MainWindow(QMainWindow):
         elif msg_type == MSG_SCREEN_FRAME:
             if self._screen_guest and self._screen_tab._streaming:
                 self._screen_guest.push_frame_data(payload)
-        elif msg_type in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK):
+        elif msg_type in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK):
             if self._file_manager: self._file_manager.handle_incoming(msg_type, sender_id, payload)
+        elif msg_type == MSG_CINEMA_CMD and len(payload) > 0:
+            self._handle_cinema_guest(payload)
 
     def _handle_text(self, msg_type: int, sender_id: int, target_id: int, payload: bytes) -> None:
         broadcast_frame = build_frame(MSG_TEXT, sender_id, BROADCAST_ID, payload)
@@ -573,6 +628,155 @@ class MainWindow(QMainWindow):
         self._btn_expand_panel.setVisible(collapsed)
         if collapsed: self._btn_expand_panel.raise_()
 
+    # ═════════════════════════════════════════
+    # 电影院事件处理
+    # ═════════════════════════════════════════
+
+    def _handle_cinema_host(self, msg_type: int, sender_id: int, target_id: int, payload: bytes) -> None:
+        """房主端：处理房客发来的电影院命令"""
+        if len(payload) == 0:
+            return
+        cmd = payload[0]
+        log.log(TAG, f"[HOST-CINEMA] received cmd=0x{cmd:02X} from sender={sender_id}")
+        if cmd == CINEMA_PAUSE or cmd == CINEMA_PLAY:
+            if self._cinema_host:
+                self._cinema_host.handle_guest_command(cmd, payload)
+        elif cmd == CINEMA_SYNC_REQ:
+            log.log(TAG, "[HOST-CINEMA] processing SYNC_REQ, calling _send_sync")
+            if self._cinema_host:
+                self._cinema_host.handle_guest_command(cmd, payload)
+        elif cmd == CINEMA_JOIN:
+            log.log(TAG, f"[HOST-CINEMA] guest={sender_id} JOIN, host_playing={self._cinema_host.is_playing if self._cinema_host else 'None'}")
+            if self._cinema_host and self._cinema_host.is_playing:
+                self._cinema_host.handle_guest_command(CINEMA_SYNC_REQ, b"")
+                self._chat_tab.append_system(f"房客 {sender_id} 加入了观影")
+        elif cmd == CINEMA_LEAVE:
+            self._chat_tab.append_system(f"房客 {sender_id} 离开了观影")
+
+    def _handle_cinema_guest(self, payload: bytes) -> None:
+        """房客端：处理房主发来的电影院命令"""
+        if not self._cinema_guest or len(payload) == 0:
+            return
+        cmd = payload[0]
+        log.log(TAG, f"[GUEST-CINEMA] received cmd=0x{cmd:02X} payload len={len(payload)}")
+        self._cinema_guest.handle_host_command(cmd, payload)
+
+    def _on_cinema_play(self, file_path: str) -> None:
+        """房主点击播放"""
+        if self._cinema_host:
+            self._cinema_tab.set_playing_state(True, False)
+            # 获取视频容器窗口句柄用于VLC嵌入
+            hwnd = int(self._cinema_tab.get_video_container_widget().winId())
+            self._cinema_host.start_playback(file_path, hwnd)
+
+    def _on_cinema_stop(self) -> None:
+        """房主/房客停止观影"""
+        if self._is_host and self._cinema_host:
+            self._cinema_host.stop()
+        elif self._cinema_guest:
+            self._cinema_guest.stop()
+            self._client.send_frame(MSG_CINEMA_CMD, HOST_ID, bytes([CINEMA_LEAVE]))
+        self._cinema_tab.set_playing_state(False, False)
+        self._cinema_tab.set_status("观影已结束")
+
+    def _on_cinema_toggle_pause(self) -> None:
+        """房主切换暂停"""
+        if self._cinema_host:
+            self._cinema_host.toggle_pause()
+            paused = self._cinema_host.is_paused
+            self._cinema_tab.set_playing_state(True, paused)
+
+    def _on_cinema_seek(self, position_ms: int) -> None:
+        """房主拖动进度条"""
+        if self._cinema_host:
+            self._cinema_host.seek(position_ms)
+
+    def _on_cinema_send_movie(self, file_path: str) -> None:
+        """房主发送电影文件给所有房客（广播）"""
+        if not self._server or not self._file_manager:
+            return
+        clients = self._server.clients
+        if not clients:
+            QMessageBox.information(self, "提示", "没有在线房客")
+            return
+        filename = os.path.basename(file_path)
+        self._chat_tab.append_system(f"正在向所有房客发送电影: {filename}")
+        for uid in clients:
+            self._file_manager.send_file(file_path, uid)
+        self._cinema_tab.set_status(f"正在发送电影: {filename}")
+
+    def _on_cinema_upload_movie(self, file_path: str) -> None:
+        """上传电影文件到movies文件夹"""
+        import shutil
+        os.makedirs(config.MOVIES_DIR, exist_ok=True)
+        filename = os.path.basename(file_path)
+        dest = os.path.join(config.MOVIES_DIR, filename)
+        try:
+            if os.path.abspath(file_path) != os.path.abspath(dest):
+                shutil.copy2(file_path, dest)
+            self._cinema_tab.refresh_movie_list()
+            self._cinema_tab.set_status(f"已上传: {filename}")
+            self._chat_tab.append_system(f"电影已上传到movies: {filename}")
+        except Exception as e:
+            QMessageBox.warning(self, "上传失败", str(e))
+
+    def _on_cinema_guest_join(self) -> None:
+        """房客加入观影"""
+        if not self._client or not self._cinema_guest:
+            return
+        # ★ 先把 VLC 绑定到视频容器窗口
+        hwnd = int(self._cinema_tab.get_video_container_widget().winId())
+        log.log(TAG, f"[CINEMA-GUEST] Join clicked, passing hwnd={hwnd} to cinema_guest")
+        self._cinema_guest.set_hwnd(hwnd)
+        # 发送加入命令
+        self._client.send_frame(MSG_CINEMA_CMD, HOST_ID, bytes([CINEMA_JOIN]))
+        # 请求同步（房主会回复 CINEMA_SYNC，触发 _handle_sync 自动加载文件）
+        self._cinema_guest.request_sync()
+        self._cinema_tab.set_status("已加入观影，等待同步...")
+        self._chat_tab.append_system("你加入了观影")
+
+    def _on_cinema_guest_leave(self) -> None:
+        """房客离开观影"""
+        if self._client:
+            self._client.send_frame(MSG_CINEMA_CMD, HOST_ID, bytes([CINEMA_LEAVE]))
+        if self._cinema_guest:
+            self._cinema_guest.stop()
+        self._cinema_tab.set_playing_state(False, False)
+        self._cinema_tab.set_status("已退出观影")
+        self._chat_tab.append_system("你退出了观影")
+
+    def _on_cinema_guest_pause(self) -> None:
+        """房客请求暂停/恢复"""
+        if self._cinema_guest:
+            self._cinema_guest.request_pause_resume()
+
+    def _on_cinema_fullscreen_changed(self, is_fullscreen: bool) -> None:
+        """全屏切换后重新绑定VLC到视频容器的HWND"""
+        hwnd = int(self._cinema_tab.get_video_container_widget().winId())
+        # 延迟一帧确保窗口已重建
+        QTimer.singleShot(100, lambda: self._rebind_vlc_hwnd(hwnd))
+
+    def _rebind_vlc_hwnd(self, hwnd: int) -> None:
+        """重新绑定VLC播放器到新窗口句柄"""
+        player = None
+        if self._is_host and self._cinema_host:
+            player = self._cinema_host._player
+        elif self._cinema_guest:
+            player = self._cinema_guest._player
+
+        if player and hasattr(player, 'set_hwnd'):
+            try:
+                player.set_hwnd(hwnd)
+                log.log(TAG, f"VLC rebound to HWND={hwnd}")
+            except Exception as e:
+                log.warn(TAG, f"VLC rebind failed: {e}")
+
+    def _on_reconnected(self) -> None:
+        """重连成功后的预处理（完整初始化在_on_joined中完成）"""
+        log.log(TAG, "Reconnected, waiting for re-join ACK...")
+        self._status_bar.showMessage("已重新连接 — 等待重新加入房间...")
+        self._chat_tab.append_system("正在重新连接到房间...")
+
     def closeEvent(self, event) -> None:
         self._online_refresh_timer.stop()
         if self._screen_host: self._screen_host.stop()
@@ -580,6 +784,8 @@ class MainWindow(QMainWindow):
         if self._system_audio_capture: self._system_audio_capture.stop()
         if self._audio_mixer: self._audio_mixer.stop()
         if self._guest_audio: self._guest_audio.stop()
+        if self._cinema_host: self._cinema_host.cleanup()
+        if self._cinema_guest: self._cinema_guest.cleanup()
         self._host_mic_running = False
         if self._host_mic_thread: self._host_mic_thread.join(timeout=3)
         self._close_voice_tcp()
