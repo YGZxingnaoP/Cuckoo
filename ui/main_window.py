@@ -18,7 +18,8 @@ from core.protocol import (
     NicknameRegistry, MSG_TEXT, MSG_SCREEN_FRAME, MSG_COMMAND, MSG_VOICE,
     CMD_SCREEN_START, CMD_SCREEN_STOP, HOST_ID, BROADCAST_ID, build_frame,
     MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK,
-    MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP, MSG_CINEMA_CMD,
+    MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP, MSG_FILE_CANCEL,
+    MSG_FILE_RETRANSMIT_REQ, MSG_FILE_VERIFY, MSG_CINEMA_CMD,
     CINEMA_PLAY, CINEMA_PAUSE, CINEMA_SEEK, CINEMA_SYNC, CINEMA_STOP,
     CINEMA_CHANGE, CINEMA_SYNC_REQ, CINEMA_JOIN, CINEMA_LEAVE
 )
@@ -35,7 +36,7 @@ from func.screen_share.guest import ScreenGuest
 from func.voice_chat.mixer import AudioMixer
 from func.voice_chat.guest_audio import GuestAudio
 from func.voice_chat.system_audio import SystemAudioCapture
-from func.file_transfer.unified_file import UnifiedFileTransfer
+from func.file_transfer import UnifiedFileTransfer
 from func.cinema.cinema_host import CinemaHost
 from func.cinema.cinema_guest import CinemaGuest
 
@@ -146,6 +147,7 @@ class MainWindow(QMainWindow):
         self._file_tab.folder_send_requested.connect(self._on_folder_send)
         self._file_tab.resume_requested.connect(self._on_resume_requested)
         self._file_tab.clear_requested.connect(self._on_clear_requested)
+        self._file_tab.cancel_requested.connect(self._on_cancel_requested)  # 【新增】取消传输
 
         self._client_event.connect(self._on_client_event_ui)
         self._targets_changed.connect(self._on_targets_changed_ui)
@@ -164,6 +166,9 @@ class MainWindow(QMainWindow):
         self._cinema_tab.guest_leave_requested.connect(self._on_cinema_guest_leave)
         self._cinema_tab.guest_pause_requested.connect(self._on_cinema_guest_pause)
         self._cinema_tab.fullscreen_changed.connect(self._on_cinema_fullscreen_changed)
+        self._cinema_tab.subtitle_size_changed.connect(self._on_subtitle_size_changed)
+        self._cinema_tab.subtitle_extract_requested.connect(self._on_subtitle_extract)
+        self._cinema_tab.spu_track_changed.connect(self._on_spu_track_changed)
         
         if self._is_host:
             self._screen_tab.share_audio_toggled.connect(self._on_share_audio_toggled)
@@ -226,7 +231,8 @@ class MainWindow(QMainWindow):
             
             # 注册文件处理器 (透明中转 + 本地处理)
             for msg_t in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
-                          MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP):
+                          MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP,
+                          MSG_FILE_CANCEL, MSG_FILE_RETRANSMIT_REQ, MSG_FILE_VERIFY):
                 self._server.register_handler(msg_t, self._handle_file)
             # 注册电影院处理器
             self._server.register_handler(MSG_CINEMA_CMD, self._handle_cinema_host)
@@ -399,7 +405,8 @@ class MainWindow(QMainWindow):
             if self._screen_guest and self._screen_tab._streaming:
                 self._screen_guest.push_frame_data(payload)
         elif msg_type in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
-                          MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP):
+                          MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP,
+                          MSG_FILE_CANCEL, MSG_FILE_RETRANSMIT_REQ, MSG_FILE_VERIFY):
             if self._file_manager: self._file_manager.handle_incoming(msg_type, sender_id, payload)
         elif msg_type == MSG_CINEMA_CMD and len(payload) > 0:
             self._handle_cinema_guest(payload)
@@ -453,6 +460,12 @@ class MainWindow(QMainWindow):
 
     def _on_clear_requested(self, task_id: str):
         if self._file_manager: self._file_manager.clear_task(task_id)
+
+    def _on_cancel_requested(self, task_id: str):
+        """取消当前传输"""
+        if self._file_manager:
+            self._file_manager.cancel_task(task_id)
+            self._file_tab.set_status("已取消传输")
 
     def _on_file_complete(self, task_id: str, path: str) -> None:
         name = os.path.basename(path) if os.path.sep in path or '/' in path else path
@@ -676,9 +689,11 @@ class MainWindow(QMainWindow):
         """房主点击播放"""
         if self._cinema_host:
             self._cinema_tab.set_playing_state(True, False)
-            # 获取视频容器窗口句柄用于VLC嵌入
-            hwnd = int(self._cinema_tab.get_video_container_widget().winId())
+            container = self._cinema_tab.get_video_container_widget()
+            container.winId()  # 强制创建原生窗口
+            hwnd = int(container.winId())
             self._cinema_host.start_playback(file_path, hwnd)
+            QTimer.singleShot(2000, self._refresh_cinema_spu_tracks)
 
     def _on_cinema_stop(self) -> None:
         """房主/房客停止观影"""
@@ -735,15 +750,17 @@ class MainWindow(QMainWindow):
         """房客加入观影"""
         if not self._client or not self._cinema_guest:
             return
-        # ★ 先把 VLC 绑定到视频容器窗口
-        hwnd = int(self._cinema_tab.get_video_container_widget().winId())
+        # ★ 强制创建原生窗口再取 HWND（winId() 首次调用才创建，第二次才有有效值）
+        container = self._cinema_tab.get_video_container_widget()
+        container.winId()
+        hwnd = int(container.winId())
+        log.log(TAG, f"Guest join: hwnd={hwnd}")
         self._cinema_guest.set_hwnd(hwnd)
-        # 发送加入命令
         self._client.send_frame(MSG_CINEMA_CMD, HOST_ID, bytes([CINEMA_JOIN]))
-        # 请求同步（房主会回复 CINEMA_SYNC，触发 _handle_sync 自动加载文件）
         self._cinema_guest.request_sync()
         self._cinema_tab.set_status("已加入观影，等待同步...")
         self._chat_tab.append_system("你加入了观影")
+        QTimer.singleShot(3000, self._refresh_cinema_spu_tracks)
 
     def _on_cinema_guest_leave(self) -> None:
         """房客离开观影"""
@@ -761,25 +778,64 @@ class MainWindow(QMainWindow):
             self._cinema_guest.request_pause_resume()
 
     def _on_cinema_fullscreen_changed(self, is_fullscreen: bool) -> None:
-        """全屏切换后重新绑定VLC到视频容器的HWND"""
+        """全屏切换后重建 VLC player（force 重建保证 HWND 正确绑定）"""
+        QTimer.singleShot(300, self._do_rebind_vlc)
+
+    def _do_rebind_vlc(self) -> None:
         hwnd = int(self._cinema_tab.get_video_container_widget().winId())
-        # 延迟一帧确保窗口已重建
-        QTimer.singleShot(100, lambda: self._rebind_vlc_hwnd(hwnd))
-
-    def _rebind_vlc_hwnd(self, hwnd: int) -> None:
-        """重新绑定VLC播放器到新窗口句柄"""
-        player = None
+        if hwnd == 0:
+            log.warn(TAG, "HWND is 0, skipping VLC rebind")
+            return
+        # 必须先更新 hwnd 再 force 重建，否则 VLC 绑定到旧 HWND
         if self._is_host and self._cinema_host:
-            player = self._cinema_host._player
+            self._cinema_host._hwnd = hwnd
+            self._cinema_host.set_subtitle_size(self._cinema_host._subtitle_size, force=True)
         elif self._cinema_guest:
-            player = self._cinema_guest._player
+            self._cinema_guest._hwnd = hwnd
+            self._cinema_guest.set_subtitle_size(self._cinema_guest._subtitle_size, force=True)
+        QTimer.singleShot(2000, self._refresh_cinema_spu_tracks)
 
-        if player and hasattr(player, 'set_hwnd'):
-            try:
-                player.set_hwnd(hwnd)
-                log.log(TAG, f"VLC rebound to HWND={hwnd}")
-            except Exception as e:
-                log.warn(TAG, f"VLC rebind failed: {e}")
+    def _on_subtitle_size_changed(self, size: int) -> None:
+        """字幕字号变更（纯本地，host/guest 各自处理）"""
+        if self._is_host and self._cinema_host:
+            self._cinema_host.set_subtitle_size(size)
+        elif self._cinema_guest:
+            self._cinema_guest.set_subtitle_size(size)
+
+    def _on_subtitle_extract(self) -> None:
+        """提取字幕按钮：强制重新缩放ASS并重建player"""
+        if self._is_host and self._cinema_host:
+            self._cinema_host.set_subtitle_size(self._cinema_host._subtitle_size, force=True)
+        elif self._cinema_guest:
+            self._cinema_guest.set_subtitle_size(self._cinema_guest._subtitle_size, force=True)
+
+    def _on_spu_track_changed(self, track_id: int) -> None:
+        """字幕轨道切换"""
+        if self._is_host and self._cinema_host:
+            self._cinema_host.set_subtitle_track(track_id)
+        elif self._cinema_guest:
+            self._cinema_guest.set_subtitle_track(track_id)
+
+    def _refresh_cinema_spu_tracks(self) -> None:
+        """刷新字幕轨道下拉框"""
+        tracks = []
+        if self._is_host and self._cinema_host:
+            tracks = self._cinema_host.get_spu_tracks()
+        elif self._cinema_guest:
+            tracks = self._cinema_guest.get_spu_tracks()
+        if tracks:
+            self._cinema_tab.set_spu_tracks(tracks)
+        # 延迟再刷新一次（VLC 异步填充轨道列表）
+        QTimer.singleShot(1500, self._refresh_spu_again)
+
+    def _refresh_spu_again(self) -> None:
+        tracks = []
+        if self._is_host and self._cinema_host:
+            tracks = self._cinema_host.get_spu_tracks()
+        elif self._cinema_guest:
+            tracks = self._cinema_guest.get_spu_tracks()
+        if tracks:
+            self._cinema_tab.set_spu_tracks(tracks)
 
     def _on_reconnected(self) -> None:
         """重连成功后的预处理（完整初始化在_on_joined中完成）"""

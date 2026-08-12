@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QFileDialog, QSlider,
     QGroupBox, QFrame, QSplitter, QMessageBox, QMainWindow, QLayout,
-    QApplication
+    QComboBox, QApplication
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QRect
 from PySide6.QtGui import QKeyEvent, QScreen
@@ -66,6 +66,11 @@ class CinemaTab(QWidget):
     # 全屏切换信号（通知外部重新绑定VLC HWND）
     fullscreen_changed = Signal(bool)      # True=进入全屏, False=退出全屏
 
+    # 字幕字号变更信号（纯本地，不涉及网络）
+    subtitle_size_changed = Signal(int)    # 10-40
+    subtitle_extract_requested = Signal()   # 提取字幕按钮
+    spu_track_changed = Signal(int)          # 字幕轨道切换
+
     def __init__(self, is_host: bool, parent=None):
         super().__init__(parent)
         self.setObjectName("cinemaTab")
@@ -75,8 +80,12 @@ class CinemaTab(QWidget):
         self._current_total_ms = 0
         self._fullscreen = False
         self._fullscreen_window: Optional[FullscreenWindow] = None
-        self._seeking = False  # 用户正在拖动进度条
-        # 保存视频容器在原布局中的位置信息
+        self._seeking = False
+        self._sub_debounce_timer = QTimer(self)
+        self._sub_debounce_timer.setSingleShot(True)
+        self._sub_debounce_timer.setInterval(400)
+        self._sub_debounce_timer.timeout.connect(self._on_sub_debounce_fire)
+        self._pending_sub_size: int = config.DEFAULT_SUBTITLE_SIZE
         self._video_parent_layout: Optional[QLayout] = None
         self._video_parent_index: int = -1
         self._init_ui()
@@ -212,8 +221,10 @@ class CinemaTab(QWidget):
             "color: #666; font-size: 16px; background: transparent; border: none;"
         )
         video_layout = QVBoxLayout(self._video_container)
+        video_layout.setContentsMargins(0, 0, 0, 0)
         video_layout.addWidget(self._video_label)
-        right_layout.addWidget(self._video_container, stretch=1)
+        # stretch=10 确保视频容器拿满空间，状态栏/进度条/按钮/字幕设置被挤压到最小
+        right_layout.addWidget(self._video_container, stretch=10)
 
         # 状态栏
         self._status_label = QLabel("就绪")
@@ -266,6 +277,73 @@ class CinemaTab(QWidget):
 
         ctrl_row.addStretch()
         right_layout.addLayout(ctrl_row)
+
+        # ── 字幕设置 QGroupBox ──
+        sub_group = QGroupBox("字幕设置")
+        sub_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                color: #ccc;
+                border: 1px solid #2a2a2a;
+                border-radius: 6px;
+                margin-top: 8px;
+                padding-top: 14px;
+                background-color: #0f0f0f;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
+        sub_layout = QVBoxLayout(sub_group)
+        sub_layout.setSpacing(4)
+
+        # 语言选择行
+        lang_row = QHBoxLayout()
+        lang_row.addWidget(QLabel("语言:"))
+        self._spu_combo = QComboBox()
+        self._spu_combo.setMinimumWidth(200)
+        self._spu_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #141414; border: 1px solid #2a2a2a;
+                border-radius: 4px; padding: 2px 6px; color: #f0f0f0;
+            }
+            QComboBox::drop-down { border: none; width: 20px; }
+            QComboBox QAbstractItemView {
+                background-color: #141414; border: 1px solid #2a2a2a;
+                selection-background-color: #2a2a2a; color: #f0f0f0;
+            }
+        """)
+        self._spu_combo.currentIndexChanged.connect(self._on_spu_track_changed)
+        lang_row.addWidget(self._spu_combo, stretch=1)
+        sub_layout.addLayout(lang_row)
+
+        # 字号 + 提取按钮行
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("大小:"))
+        self._subtitle_slider = QSlider(Qt.Horizontal)
+        self._subtitle_slider.setRange(10, 40)
+        self._subtitle_slider.setValue(config.DEFAULT_SUBTITLE_SIZE)
+        self._subtitle_slider.setTickPosition(QSlider.TicksBelow)
+        self._subtitle_slider.setTickInterval(5)
+        self._subtitle_slider.setFixedWidth(160)
+        self._subtitle_slider.valueChanged.connect(self._on_subtitle_size_changed)
+        self._subtitle_label = QLabel(str(config.DEFAULT_SUBTITLE_SIZE))
+        self._subtitle_label.setFixedWidth(24)
+        self._subtitle_label.setStyleSheet("color: #aaa; font-size: 11px; background: transparent; border: none;")
+        size_row.addWidget(self._subtitle_slider)
+        size_row.addWidget(self._subtitle_label)
+        self._btn_extract_sub = QPushButton("📝 提取ASS")
+        self._btn_extract_sub.setMinimumHeight(28)
+        self._btn_extract_sub.setStyleSheet(self._btn_minor_style())
+        self._btn_extract_sub.setToolTip("从MKV提取ASS字幕并缩放匹配当前字号")
+        self._btn_extract_sub.clicked.connect(self._on_extract_sub_clicked)
+        size_row.addWidget(self._btn_extract_sub)
+        size_row.addStretch()
+        sub_layout.addLayout(size_row)
+
+        right_layout.addWidget(sub_group)
 
         main_layout.addWidget(right_panel, stretch=1)
 
@@ -403,20 +481,54 @@ class CinemaTab(QWidget):
         else:
             self._enter_fullscreen()
 
+    def _on_subtitle_size_changed(self, value: int) -> None:
+        self._subtitle_label.setText(str(value))
+        self._pending_sub_size = value
+        self._sub_debounce_timer.start()  # 重启计时器，400ms 内连续拖动不触发
+
+    def _on_sub_debounce_fire(self) -> None:
+        """滑条停止拖动 400ms 后才真正触发字幕重建"""
+        self.subtitle_size_changed.emit(self._pending_sub_size)
+
+    def _on_extract_sub_clicked(self) -> None:
+        self.subtitle_extract_requested.emit()
+
+    def _on_spu_track_changed(self, index: int) -> None:
+        track_id = self._spu_combo.currentData()
+        if track_id is not None:
+            self.spu_track_changed.emit(track_id)
+
+    def set_spu_tracks(self, tracks: list[tuple[int, str]]) -> None:
+        """填充字幕轨道下拉框"""
+        current = self._spu_combo.currentData()
+        self._spu_combo.blockSignals(True)
+        self._spu_combo.clear()
+        for tid, name in tracks:
+            self._spu_combo.addItem(name, tid)
+        # 恢复选中
+        for i in range(self._spu_combo.count()):
+            if self._spu_combo.itemData(i) == current:
+                self._spu_combo.setCurrentIndex(i)
+                break
+        self._spu_combo.blockSignals(False)
+
     def _enter_fullscreen(self) -> None:
         """进入全屏：把视频容器提升到独立全屏窗口"""
         if self._fullscreen:
             return
 
-        # 1. 保存原布局位置
+        # 1. 保存原布局位置和 stretch factor
         parent_layout = None
         parent_index = -1
+        self._saved_stretch = 10
         parent_widget = self._video_container.parentWidget()
         if parent_widget and parent_widget.layout():
             parent_layout = parent_widget.layout()
             for i in range(parent_layout.count()):
-                if parent_layout.itemAt(i).widget() is self._video_container:
+                item = parent_layout.itemAt(i)
+                if item.widget() is self._video_container:
                     parent_index = i
+                    self._saved_stretch = parent_layout.stretch(i)
                     break
 
         self._video_parent_layout = parent_layout
@@ -435,6 +547,7 @@ class CinemaTab(QWidget):
         self._fullscreen = True
         self._btn_fullscreen.setText("⛶ 退出全屏")
         self._status_label.setText("全屏模式 — 按 Esc 退出")
+        self._video_container.winId()  # 强制创建原生窗口
         self.fullscreen_changed.emit(True)
 
     def _exit_fullscreen(self) -> None:
@@ -442,26 +555,35 @@ class CinemaTab(QWidget):
         if not self._fullscreen:
             return
 
-        # 1. 关闭全屏窗口
+        # 1. 先隐藏全屏窗口避免闪烁，再取出视频容器
         fw = self._fullscreen_window
         self._fullscreen_window = None
         if fw:
-            fw.takeCentralWidget()  # 取出 video_container，避免被销毁
+            fw.hide()
+            fw.takeCentralWidget()
             fw.close()
             fw.deleteLater()
 
-        # 2. 把视频容器放回原布局
+        # 2. 把视频容器放回原布局，恢复 stretch
         self._video_container.setParent(None)
         if self._video_parent_layout and self._video_parent_index >= 0:
-            self._video_parent_layout.insertWidget(self._video_parent_index, self._video_container)
+            self._video_parent_layout.insertWidget(self._video_parent_index, self._video_container,
+                                                    stretch=getattr(self, '_saved_stretch', 10))
         self._video_container.setStyleSheet(
             "background-color: #000000; border: 1px solid #2a2a2a; border-radius: 4px;"
         )
         self._video_container.show()
 
+        # 3. 强制布局刷新，修复退出全屏后位置偏移
+        if self._video_parent_layout:
+            self._video_parent_layout.activate()
+            self._video_parent_layout.update()
+        QTimer.singleShot(50, self._video_container.updateGeometry)
+
         self._fullscreen = False
         self._btn_fullscreen.setText("⛶ 全屏")
         self._status_label.setText("")
+        self._video_container.winId()  # 强制创建原生窗口
         self.fullscreen_changed.emit(False)
 
     @property

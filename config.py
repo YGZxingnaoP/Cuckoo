@@ -52,11 +52,17 @@ MIX_INTERVAL: float = 0.032   # 混音时间片（秒）→ 32ms
 # ─────────────────────────────────────────────
 # 文件传输参数
 # ─────────────────────────────────────────────
-FILE_CHUNK_SIZE: int = 65536  # 64KB 每块（星型拓扑推荐）
-FILE_SEND_DELAY: float = 0.001  # 每块发送间隔(秒)，防止占满带宽
-FILE_QUEUE_MAX: int = 2000     # 每客户端文件块队列上限（增大缓冲区，配合阻塞put）
-FILE_ACK_INTERVAL: int = 32    # 每收多少个chunk发送一次ACK
-FILE_ACK_TIMEOUT: float = 5.0  # ACK等待超时(秒)
+FILE_CHUNK_SIZE: int = 65536        # 64KB 每块（星型拓扑推荐）
+FILE_SEND_DELAY: float = 0.001      # 每块发送间隔(秒)，防止占满带宽（保留兼容）
+FILE_QUEUE_MAX: int = 2000          # 每客户端文件块队列上限
+FILE_POOL_SIZE: int = 32 * 1024 * 1024   # 蓄水池上限：32MB（发送方未确认数据上限）
+FILE_ACK_THRESHOLD: int = 2 * 1024 * 1024  # ACK 阈值：每接收 2MB 确认一次
+FILE_ACK_FINAL_TIMEOUT: int = 60    # 最终ACK等待超时（秒）
+FILE_POOL_STALL_TIMEOUT: int = 10   # 蓄水池停滞超时（秒），超过则强制继续防止死锁
+FILE_WRITE_QUEUE_MAX: int = 512     # 写盘队列上限（内存保护）
+LARGE_FILE_THRESHOLD: int = 2 * 1024 * 1024 * 1024  # 2GB：超过此大小启用MD5校验+chunk重传
+MAX_RETRANSMIT_ROUNDS: int = 10     # 大文件最大重传轮数（防止无限重传）
+FILE_META_BATCH_SIZE: int = 5000    # 元数据分片：每批最多文件数（约660KB，远小于16MB帧上限）
 
 # ─────────────────────────────────────────────
 # 服务端参数
@@ -95,3 +101,4 @@ DOWNLOAD_DIR: str = _os.path.join(_BASE_DIR, "downloads")
 MOVIES_DIR: str = _os.path.join(_BASE_DIR, "movies")
 CINEMA_SYNC_INTERVAL: float = 5.0    # 同步广播间隔（秒）
 CINEMA_SYNC_THRESHOLD: float = 0.1   # 偏差阈值（秒），超过此值才seek校正
+DEFAULT_SUBTITLE_SIZE: int = 16      # 字幕相对字号（VLC 默认16，范围10-40）

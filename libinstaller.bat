@@ -5,7 +5,7 @@ title Cuckoo 项目依赖安装工具
 :: ============================================================
 :: 1. 设置路径（请根据你的实际目录修改）
 :: ============================================================
-set RUNTIME_DIR=D:\.Cuckoo\runtime
+set RUNTIME_DIR=D:\.Cuckoo\OriginCode\runtime
 set PYTHON_EXE=%RUNTIME_DIR%\python.exe
 set PIP_CMD=%PYTHON_EXE% -m pip
 
@@ -77,8 +77,8 @@ echo [OK] 镜像源配置完成。
 :: ============================================================
 echo.
 echo [安装] 开始安装项目依赖库（可能需要几分钟）...
-echo 依赖列表：PySide6, opencv-python, mss, pyaudio, numpy
-%PIP_CMD% install PySide6 opencv-python mss pyaudio numpy
+echo 依赖列表：PySide6, opencv-python, mss, pyaudio, numpy, soundcard, dxcam, comtypes, pyturbojpeg, python-vlc
+%PIP_CMD% install PySide6 opencv-python mss pyaudio numpy soundcard dxcam comtypes pyturbojpeg python-vlc
 if errorlevel 1 (
     echo [错误] 依赖安装失败，请检查网络或手动重试。
     pause

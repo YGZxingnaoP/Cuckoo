@@ -16,7 +16,8 @@ from core.protocol import (
     MSG_TEXT, MSG_FILE_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
     MSG_FILE_TASK_META, MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK, MSG_SCREEN_FRAME,
     MSG_COMMAND, MSG_VOICE, MSG_CINEMA_CMD,
-    MSG_FILE_OFFER, MSG_FILE_OFFER_RESP,
+    MSG_FILE_OFFER, MSG_FILE_OFFER_RESP, MSG_FILE_CANCEL,
+    MSG_FILE_RETRANSMIT_REQ, MSG_FILE_VERIFY,
     CMD_JOIN, CMD_JOIN_ACK, CMD_LEAVE, CMD_USER_LIST
 )
 import config
@@ -355,33 +356,55 @@ class Server:
         if msg_type == MSG_SCREEN_FRAME:
             target_q, can_drop = info.media_queue, True
         elif msg_type == MSG_FILE_CHUNK:
-            target_q, can_drop = info.file_queue, False
+            # 数据块：阻塞入队（正确 TCP 背压，绝不丢块）。
+            # 蓄水池在上游已把在途数据限制在 32MB，而 file_queue 容量 128MB，
+            # 因此正常不会满；即使极端拥塞满，阻塞也让发送方自然减速。
+            target_q, can_drop = info.file_queue, "block"
         elif msg_type in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK_ACK,
-                          MSG_FILE_OFFER, MSG_FILE_OFFER_RESP):
-            target_q, can_drop = info.file_queue, False
+                          MSG_FILE_OFFER, MSG_FILE_OFFER_RESP, MSG_FILE_CANCEL,
+                          MSG_FILE_RETRANSMIT_REQ, MSG_FILE_VERIFY):
+            # 控制消息：小体积，非阻塞入队（可能被 UI 线程调用，不能卡 UI）。
+            # 蓄水池保证 file_queue 几乎不会满，put_nowait 失败概率极低。
+            target_q, can_drop = info.file_queue, "nowait"
         elif msg_type == MSG_CINEMA_CMD:
             target_q, can_drop = info.priority_queue, False  # 电影院命令不可丢弃
         else:
             target_q, can_drop = info.priority_queue, True
 
         try:
-            if can_drop and target_q.full():
+            if can_drop == True and target_q.full():
                 try: target_q.get_nowait()
                 except queue.Empty: pass
-            if not can_drop:
-                # 【P0修复】文件块采用阻塞put，让TCP背压自然流控，绝不丢弃
-                target_q.put(frame_bytes, timeout=30.0)
+                target_q.put_nowait(frame_bytes)
+            elif can_drop == "block":
+                # 数据块：阻塞入队（正确背压），但定期检查 client 是否断开，防止永久死锁
+                while True:
+                    try:
+                        target_q.put(frame_bytes, timeout=5.0)
+                        break
+                    except queue.Full:
+                        with self._clients_lock:
+                            if uid not in self._clients:
+                                log.warn(TAG, f"Client {uid} disconnected, dropping queued chunk")
+                                return
+                        # client 仍在，继续阻塞等待背压解除
+            elif can_drop == "nowait":
+                try:
+                    target_q.put_nowait(frame_bytes)
+                except queue.Full:
+                    # 极小概率：丢弃旧投屏帧腾空间后重试一次
+                    try:
+                        info.media_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        target_q.put_nowait(frame_bytes)
+                    except queue.Full:
+                        log.error(TAG, f"File control queue full for client {uid}, msg_type={msg_type} dropped")
             else:
                 target_q.put_nowait(frame_bytes)
         except queue.Full:
-            if not can_drop:
-                log.error(TAG, f"File queue stuck for client {uid}, dropping chunk after 30s timeout")
-                # 最后手段：丢弃投屏帧腾空间
-                try: info.media_queue.get_nowait()
-                except queue.Empty: pass
-                try: target_q.put_nowait(frame_bytes)
-                except queue.Full:
-                    log.error(TAG, f"CRITICAL: File queue still full for client {uid}, chunk lost")
+            pass
             
     def _remove_client(self, uid: int) -> None:
         with self._clients_lock: info = self._clients.pop(uid, None)

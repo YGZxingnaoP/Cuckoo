@@ -17,10 +17,12 @@ class FileTab(QWidget):
     folder_send_requested = Signal(str, int)
     resume_requested = Signal(str)
     clear_requested = Signal(str)
+    cancel_requested = Signal(str)  # 【新增】取消传输
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("fileTab")
+        self._current_task_id: str = ""  # 【新增】当前活跃任务
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -133,6 +135,25 @@ class FileTab(QWidget):
         self._btn_folder.clicked.connect(self._on_select_folder)
         btn_layout.addWidget(self._btn_folder, 0, 1)
         
+        self._btn_cancel = QPushButton("取消当前传输")
+        self._btn_cancel.setObjectName("btnActionDanger")
+        self._btn_cancel.setMinimumHeight(48)
+        self._btn_cancel.setStyleSheet("""
+            QPushButton#btnActionDanger {
+                background-color: #3a1a1a;
+                color: #ff6b6b;
+                font-weight: bold;
+                font-size: 14px;
+                border: 1px solid #5a2a2a;
+                border-radius: 8px;
+                padding: 10px;
+            }
+            QPushButton#btnActionDanger:hover { background-color: #4a2a2a; border: 1px solid #6a3a3a; }
+            QPushButton#btnActionDanger:pressed { background-color: #2a1010; }
+        """)
+        self._btn_cancel.clicked.connect(self._on_cancel)
+        btn_layout.addWidget(self._btn_cancel, 1, 0, 1, 2)  # 占两列
+        
         layout.addLayout(btn_layout)
 
         # ── 4. 断点续传区 ──
@@ -238,6 +259,7 @@ class FileTab(QWidget):
 
     def update_progress(self, task_id: str, percent: int, speed: str = "", eta: str = "") -> None:
         self._progress.setValue(percent)
+        self._current_task_id = task_id  # 追踪当前活跃任务
         if speed: self._speed_label.setText(f"速度：{speed}")
         if eta: self._eta_label.setText(f"剩余：{eta}")
 
@@ -268,3 +290,12 @@ class FileTab(QWidget):
         if item:
             self.clear_requested.emit(item.data(Qt.UserRole))
             self._interrupt_list.takeItem(self._interrupt_list.row(item))
+
+    def _on_cancel(self):
+        """取消当前正在进行的传输"""
+        if self._current_task_id:
+            self.cancel_requested.emit(self._current_task_id)
+
+    def set_current_task(self, task_id: str) -> None:
+        """设置当前活跃的传输任务ID（用于取消操作）"""
+        self._current_task_id = task_id

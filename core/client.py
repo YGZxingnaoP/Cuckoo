@@ -18,7 +18,8 @@ from core.protocol import (
     MSG_TEXT, MSG_COMMAND, MSG_SCREEN_FRAME, MSG_FILE_META, MSG_FILE_CHUNK,
     MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
     MSG_CINEMA_CMD, MSG_FILE_CHUNK_ACK,
-    MSG_FILE_OFFER, MSG_FILE_OFFER_RESP,
+    MSG_FILE_OFFER, MSG_FILE_OFFER_RESP, MSG_FILE_CANCEL,
+    MSG_FILE_RETRANSMIT_REQ, MSG_FILE_VERIFY,
     CMD_JOIN, CMD_JOIN_ACK, CMD_LEAVE, CMD_USER_LIST,
     HOST_ID, BROADCAST_ID
 )
@@ -75,7 +76,13 @@ class ClientConnection(QObject):
         self._priority_queue.put(join_frame)
 
     def _recv_loop(self) -> None:
+        """接收循环（首次连接和重连后共用）"""
         log.log(TAG, "Receiver thread started")
+        self._run_recv_loop()
+        log.log(TAG, "Receiver thread stopped")
+
+    def _run_recv_loop(self) -> None:
+        """接收循环核心逻辑"""
         def recv_exact(n: int) -> bytes:
             buf = bytearray()
             while len(buf) < n:
@@ -84,10 +91,11 @@ class ClientConnection(QObject):
                 buf.extend(chunk)
             return bytes(buf)
 
-        try:
-            while self._running:
+        while self._running:
+            try:
                 result = read_frame(recv_exact)
-                if result is None: break
+                if result is None:
+                    break
                 msg_type, sender_id, target_id, payload = result
 
                 if msg_type == MSG_COMMAND and len(payload) > 0:
@@ -109,61 +117,17 @@ class ClientConnection(QObject):
 
                 self.frame_received.emit(msg_type, sender_id, target_id, payload)
 
-        except (ConnectionError, OSError) as e:
-            log.warn(TAG, f"Connection lost: {e}, attempting reconnect...")
-            if self._try_reconnect():
-                log.log(TAG, "Reconnection successful, resuming receiver")
-                # 重新进入接收循环
-                self._recv_loop_after_reconnect()
-                return
-            elif not self._disconnected_emitted:
-                self._disconnected_emitted = True
-                self.disconnected.emit()
-        finally:
-            log.log(TAG, "Receiver thread stopped")
-
-    def _recv_loop_after_reconnect(self) -> None:
-        """重连后的接收循环（复用原有逻辑）"""
-        def recv_exact(n: int) -> bytes:
-            buf = bytearray()
-            while len(buf) < n:
-                chunk = self._sock.recv(n - len(buf))
-                if not chunk: raise ConnectionError("Connection closed by host")
-                buf.extend(chunk)
-            return bytes(buf)
-
-        try:
-            while self._running:
-                result = read_frame(recv_exact)
-                if result is None: break
-                msg_type, sender_id, target_id, payload = result
-
-                if msg_type == MSG_COMMAND and len(payload) > 0:
-                    cmd = payload[0]
-                    if cmd == CMD_JOIN_ACK:
-                        self._handle_join_ack(payload)
-                        continue
-                    elif cmd == CMD_USER_LIST:
-                        self._handle_user_list(payload)
-                        continue
-                    elif cmd == CMD_JOIN:
-                        nick = payload[1:].decode("utf-8", errors="replace")
-                        self.user_joined.emit(sender_id, nick)
-                        continue
-                    elif cmd == CMD_LEAVE:
-                        nick = payload[1:].decode("utf-8", errors="replace")
-                        self.user_left.emit(sender_id, nick)
-                        continue
-
-                self.frame_received.emit(msg_type, sender_id, target_id, payload)
-
-        except (ConnectionError, OSError) as e:
-            log.error(TAG, f"Connection lost after reconnect: {e}")
-            if not self._disconnected_emitted:
-                self._disconnected_emitted = True
-                self.disconnected.emit()
-        finally:
-            log.log(TAG, "Receiver thread stopped (post-reconnect)")
+            except (ConnectionError, OSError) as e:
+                if not self._running:
+                    break
+                log.warn(TAG, f"Connection lost: {e}, attempting reconnect...")
+                if self._try_reconnect():
+                    log.log(TAG, "Reconnection successful, resuming receiver")
+                    continue  # 重新进入接收循环
+                elif not self._disconnected_emitted:
+                    self._disconnected_emitted = True
+                    self.disconnected.emit()
+                break
 
     def _try_reconnect(self) -> bool:
         """尝试重连，返回是否成功"""
@@ -279,8 +243,19 @@ class ClientConnection(QObject):
         self.user_list.emit(list(users.items()))
 
     def send_frame(self, msg_type: int, target_id: int, payload: bytes = b"") -> None:
-        """构建并发送一帧。信令走优先级队列，文件走文件队列，投屏帧走媒体队列。"""
+        """构建并发送一帧。信令走优先级队列，文件数据走文件队列，投屏帧走媒体队列。
+        
+        【稳定优先】MSG_FILE_CHUNK 数据块阻塞入队（正确背压，绝不丢块）；
+        文件控制消息（offer/meta/ack 等）非阻塞入队（小体积，可能被 UI 线程调用）。
+        """
         frame = build_frame(msg_type, self._my_id, target_id, payload)
+
+        # ── 文件控制消息（小体积，非阻塞） ──
+        _FILE_CTRL_TYPES = (
+            MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
+            MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP,
+            MSG_FILE_CANCEL, MSG_FILE_RETRANSMIT_REQ, MSG_FILE_VERIFY,
+        )
 
         if msg_type == MSG_SCREEN_FRAME:
             # 投屏帧：非阻塞，满了就丢弃旧的
@@ -290,19 +265,39 @@ class ClientConnection(QObject):
                 self._media_queue.put_nowait(frame)
             except (queue.Empty, queue.Full):
                 pass
-        elif msg_type in (MSG_FILE_CHUNK, MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
-                          MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP):
-            # 【P0修复】文件相关：阻塞入队，TCP背压流控，绝不丢弃
+
+        elif msg_type == MSG_FILE_CHUNK:
+            # 数据块：阻塞入队（正确背压），但定期检查连接是否断开，防止永久死锁
+            while self._running:
+                try:
+                    self._file_queue.put(frame, timeout=5.0)
+                    break
+                except queue.Full:
+                    if not self._running:
+                        return
+                    # 仍在运行，继续阻塞等待背压解除
+            if not self._running:
+                return
+
+        elif msg_type in _FILE_CTRL_TYPES:
+            # 控制消息：非阻塞（小体积，可能 UI 线程调用，不能卡 UI）
             try:
-                self._file_queue.put(frame, timeout=30.0)
+                self._file_queue.put_nowait(frame)
             except queue.Full:
-                log.error(TAG, f"File queue stuck, dropping critical: {msg_type}")
+                log.warn(TAG, f"File ctrl queue full for msg_type={msg_type}, drain media")
+                try:
+                    self._media_queue.get_nowait()
+                    self._file_queue.put_nowait(frame)
+                except (queue.Empty, queue.Full):
+                    log.error(TAG, f"CRITICAL: file ctrl msg_type={msg_type} dropped")
+
         elif msg_type == MSG_CINEMA_CMD:
-            # 电影院控制命令：不可丢弃，但走信令队列（不阻塞文件队列）
+            # 电影院控制命令：不可丢弃
             try:
                 self._priority_queue.put(frame, timeout=10.0)
             except queue.Full:
                 log.error(TAG, "Priority queue stuck, cinema command lost")
+
         else:
             # 信令：非阻塞入队
             try:

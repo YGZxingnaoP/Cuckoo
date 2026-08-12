@@ -30,6 +30,7 @@ echo.
     --add-data="runtime/libvlc.dll;vlc" ^
     --add-data="runtime/libvlccore.dll;vlc" ^
     --add-data="runtime/plugins;vlc/plugins" ^
+    --add-data="runtime/ffmpeg.exe;." ^
     --hidden-import=soundcard ^
     --hidden-import=soundcard._soundcard ^
     --hidden-import=dxcam ^
@@ -43,6 +44,12 @@ echo.
     --hidden-import=func.cinema ^
     --hidden-import=func.cinema.cinema_host ^
     --hidden-import=func.cinema.cinema_guest ^
+    --hidden-import=func.cinema.subtitle_tool ^
+    --hidden-import=func.file_transfer ^
+    --hidden-import=func.file_transfer.manager ^
+    --hidden-import=func.file_transfer.common ^
+    --hidden-import=func.file_transfer.send_worker ^
+    --hidden-import=func.file_transfer.recv_worker ^
     main.py
 
 echo.
