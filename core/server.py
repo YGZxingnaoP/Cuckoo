@@ -16,6 +16,7 @@ from core.protocol import (
     MSG_TEXT, MSG_FILE_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
     MSG_FILE_TASK_META, MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK, MSG_SCREEN_FRAME,
     MSG_COMMAND, MSG_VOICE, MSG_CINEMA_CMD,
+    MSG_FILE_OFFER, MSG_FILE_OFFER_RESP,
     CMD_JOIN, CMD_JOIN_ACK, CMD_LEAVE, CMD_USER_LIST
 )
 import config
@@ -355,7 +356,8 @@ class Server:
             target_q, can_drop = info.media_queue, True
         elif msg_type == MSG_FILE_CHUNK:
             target_q, can_drop = info.file_queue, False
-        elif msg_type in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK_ACK):
+        elif msg_type in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK_ACK,
+                          MSG_FILE_OFFER, MSG_FILE_OFFER_RESP):
             target_q, can_drop = info.file_queue, False
         elif msg_type == MSG_CINEMA_CMD:
             target_q, can_drop = info.priority_queue, False  # 电影院命令不可丢弃

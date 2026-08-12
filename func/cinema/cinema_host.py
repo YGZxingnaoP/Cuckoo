@@ -81,29 +81,18 @@ class CinemaHost(QObject):
                                           "--no-video-title-show")
             self._player = self._instance.media_player_new()
 
-            log.log(TAG, f"[HOST-DIAG] Player created, about to set_hwnd({hwnd})")
-
             if hwnd:
                 self._player.set_hwnd(hwnd)
-                reported = self._player.get_hwnd() if hasattr(self._player, 'get_hwnd') else 'N/A'
-                log.log(TAG, f"[HOST-DIAG] set_hwnd done, get_hwnd() reports: {reported}")
-            else:
-                log.log(TAG, "[HOST-DIAG] WARNING: hwnd is 0, VLC will create own window!")
 
             self._media = self._instance.media_new(file_path)
             self._player.set_media(self._media)
-            log.log(TAG, "[HOST-DIAG] media set, about to parse")
             self._media.parse()
-            log.log(TAG, "[HOST-DIAG] parse done")
             time.sleep(0.3)
 
-            log.log(TAG, "[HOST-DIAG] about to play()")
             self._player.play()
-            log.log(TAG, "[HOST-DIAG] play() returned, waiting 0.5s")
             time.sleep(0.5)
 
             length = self._player.get_length()
-            log.log(TAG, f"[HOST-DIAG] length={length}ms, all done")
             self._current_file = os.path.basename(file_path)
             self._playing = True
             self._paused = False
@@ -217,7 +206,6 @@ class CinemaHost(QObject):
                        struct.pack("!I", len(name_bytes)) + name_bytes)
             self._broadcast(build_frame(MSG_CINEMA_CMD, HOST_ID, BROADCAST_ID, payload))
             self.position_updated.emit(pos, total)
-            log.log(TAG, f"[HOST-DIAG] SYNC sent: pos={pos}ms total={total}ms paused={self._paused}")
         except Exception as e:
             log.error(TAG, f"Sync send error: {e}")
 

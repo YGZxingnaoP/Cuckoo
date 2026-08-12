@@ -20,7 +20,7 @@ VOICE_TCP_PORT: int = 5002   # 语音独立 TCP 通道（解决队头阻塞）
 CAPTURE_FPS: int = 15         # 默认帧率（可动态切换）
 TARGET_WIDTH: int = 1280
 TARGET_HEIGHT: int = 720
-JPEG_QUALITY: int = 70        # 1-100
+JPEG_QUALITY: int = 90        # 屏幕共享推荐 85-95，文字/UI 清晰
 
 # 分辨率预设: (名称, 宽, 高)  — 高为0表示原画
 SCREEN_PRESETS: list = [

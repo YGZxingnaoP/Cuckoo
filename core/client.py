@@ -18,6 +18,7 @@ from core.protocol import (
     MSG_TEXT, MSG_COMMAND, MSG_SCREEN_FRAME, MSG_FILE_META, MSG_FILE_CHUNK,
     MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
     MSG_CINEMA_CMD, MSG_FILE_CHUNK_ACK,
+    MSG_FILE_OFFER, MSG_FILE_OFFER_RESP,
     CMD_JOIN, CMD_JOIN_ACK, CMD_LEAVE, CMD_USER_LIST,
     HOST_ID, BROADCAST_ID
 )
@@ -289,7 +290,8 @@ class ClientConnection(QObject):
                 self._media_queue.put_nowait(frame)
             except (queue.Empty, queue.Full):
                 pass
-        elif msg_type in (MSG_FILE_CHUNK, MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK_ACK):
+        elif msg_type in (MSG_FILE_CHUNK, MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
+                          MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP):
             # 【P0修复】文件相关：阻塞入队，TCP背压流控，绝不丢弃
             try:
                 self._file_queue.put(frame, timeout=30.0)

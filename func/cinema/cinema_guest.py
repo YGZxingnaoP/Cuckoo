@@ -60,7 +60,6 @@ class CinemaGuest(QObject):
     def set_hwnd(self, hwnd: int) -> None:
         """设置 VLC 要嵌入的 Qt 窗口句柄（必须在播放前调用）"""
         self._hwnd = hwnd
-        log.log(TAG, f"[GUEST-DIAG] set_hwnd() stored hwnd={hwnd}")
 
     def has_movie(self, filename: str) -> bool:
         path = os.path.join(self._movies_dir, filename)
@@ -111,7 +110,6 @@ class CinemaGuest(QObject):
         这是核心入口 — 即使房客还没创建播放器，同步数据也会驱动初始化。
         """
         try:
-            log.log(TAG, f"[GUEST-DIAG] SYNC received, payload len={len(payload)}")
             state = payload[1]
             host_paused = (state & 0x01) != 0
             host_pos, host_total = struct.unpack("!qq", payload[2:18])
@@ -135,17 +133,12 @@ class CinemaGuest(QObject):
                         return
                     if not self._start_player_internal(path):
                         return
-                    # ★ VLC 必须先 play() 一次才能 seek ★
-                    log.log(TAG, "[GUEST-DIAG] about to play() in _handle_sync")
                     self._player.play()
-                    log.log(TAG, "[GUEST-DIAG] play() returned, waiting 0.2s")
                     time.sleep(0.2)
                     self._paused = False
-                    log.log(TAG, f"[GUEST-DIAG] about to set_time({host_pos})")
                     self._syncing = True
                     self._player.set_time(host_pos)
                     self._syncing = False
-                    log.log(TAG, "[GUEST-DIAG] set_time done")
 
             if not self._player or not self._playing:
                 return
@@ -191,28 +184,16 @@ class CinemaGuest(QObject):
                                           "--no-video-title-show")
             self._player = self._instance.media_player_new()
 
-            # 诊断：set_hwnd 前
-            log.log(TAG, f"[GUEST-DIAG] Player created, about to set_hwnd({self._hwnd})")
-
             # ★ set_hwnd 必须在 set_media/play 之前，否则 VLC 自建窗口
             if self._hwnd:
                 self._player.set_hwnd(self._hwnd)
-                # 诊断：验证 HWND 是否被 VLC 接受
-                reported = self._player.get_hwnd() if hasattr(self._player, 'get_hwnd') else 'N/A'
-                log.log(TAG, f"[GUEST-DIAG] set_hwnd done, get_hwnd() reports: {reported}")
-            else:
-                log.log(TAG, "[GUEST-DIAG] WARNING: _hwnd is 0, VLC will create its own window!")
 
             self._media = self._instance.media_new(file_path)
             self._player.set_media(self._media)
-            log.log(TAG, "[GUEST-DIAG] media set, about to parse")
             self._media.parse()
-            log.log(TAG, "[GUEST-DIAG] parse done")
             time.sleep(0.3)
 
             self._current_total = self._player.get_length()
-            self._playing = True
-            log.log(TAG, f"[GUEST-DIAG] length={self._current_total}ms, returning to _handle_sync")
             self._playing = True
             self._paused = True
 

@@ -21,6 +21,8 @@ MSG_FILE_RESUME_ACK: int = 0x08  # 发送方确认续传 (Payload: 1B status)
 MSG_FILE_TASK_META: int = 0x09   # 文件夹/断点续传任务元数据 (Payload: JSON)
 MSG_FILE_CHUNK_ACK: int = 0x0A   # 【新增】接收方chunk确认 (Payload: binary)
 MSG_CINEMA_CMD: int = 0x0B       # 【新增】电影院控制命令 (Payload: binary)
+MSG_FILE_OFFER: int = 0x0C       # 【新增】文件传输邀约 (Payload: JSON)
+MSG_FILE_OFFER_RESP: int = 0x0D  # 【新增】文件传输邀约响应 (Payload: 1B accept/reject + JSON)
 
 # ─────────────────────────────────────────────
 # 控制命令子类型

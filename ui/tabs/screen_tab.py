@@ -175,13 +175,11 @@ class ScreenTab(QWidget):
     def update_frame(self, image: QImage) -> None:
         """接收端解码线程通过信号传入 QImage，在主线程转换为 QPixmap。"""
         pixmap = QPixmap.fromImage(image)
-        self._video_label.setPixmap(
-            pixmap.scaled(
-                self._video_label.size(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-        )
+        label_size = self._video_label.size()
+        # 仅在尺寸不匹配时才缩放，避免无意义的二次滤波导致模糊
+        if abs(pixmap.width() - label_size.width()) > 2 or abs(pixmap.height() - label_size.height()) > 2:
+            pixmap = pixmap.scaled(label_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._video_label.setPixmap(pixmap)
 
     def set_speakers(self, speakers: list) -> None:
         """设置可选扬声器列表。格式: [(name, name), ...]"""

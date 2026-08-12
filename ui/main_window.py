@@ -18,7 +18,7 @@ from core.protocol import (
     NicknameRegistry, MSG_TEXT, MSG_SCREEN_FRAME, MSG_COMMAND, MSG_VOICE,
     CMD_SCREEN_START, CMD_SCREEN_STOP, HOST_ID, BROADCAST_ID, build_frame,
     MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK,
-    MSG_FILE_CHUNK_ACK, MSG_CINEMA_CMD,
+    MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP, MSG_CINEMA_CMD,
     CINEMA_PLAY, CINEMA_PAUSE, CINEMA_SEEK, CINEMA_SYNC, CINEMA_STOP,
     CINEMA_CHANGE, CINEMA_SYNC_REQ, CINEMA_JOIN, CINEMA_LEAVE
 )
@@ -189,6 +189,7 @@ class MainWindow(QMainWindow):
         self._file_manager.status_changed.connect(self._on_file_status_changed)
         self._file_manager.task_interrupted.connect(self._file_tab.add_interrupted_task)
         self._file_manager.task_removed.connect(self._file_tab.remove_interrupted_task)
+        self._file_manager.file_offer_received.connect(self._on_file_offer_received)
 
     def _on_file_status_changed(self, status: str):
         self._file_tab.set_status(status)
@@ -198,6 +199,18 @@ class MainWindow(QMainWindow):
                 self._screen_tab.stop_streaming()
                 if self._screen_guest: self._screen_guest.stop()
                 self._chat_tab.append_system("正在接收文件，已自动暂停投屏渲染")
+
+    def _on_file_offer_received(self, task_id: str, display_name: str, size_desc: str):
+        """收到文件传输邀约，弹出确认对话框"""
+        msg = f"{display_name}\n大小：{size_desc}"
+        reply = QMessageBox.question(
+            self, "文件传输请求",
+            f"有人向您发送文件：\n\n{msg}\n\n是否接收？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        if self._file_manager:
+            self._file_manager.respond_to_offer(task_id, reply == QMessageBox.Yes)
 
     # ═════════════════════════════════════════
     # 房主服务
@@ -212,7 +225,8 @@ class MainWindow(QMainWindow):
             self._server.register_handler(MSG_VOICE, self._handle_voice)
             
             # 注册文件处理器 (透明中转 + 本地处理)
-            for msg_t in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK):
+            for msg_t in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
+                          MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP):
                 self._server.register_handler(msg_t, self._handle_file)
             # 注册电影院处理器
             self._server.register_handler(MSG_CINEMA_CMD, self._handle_cinema_host)
@@ -384,7 +398,8 @@ class MainWindow(QMainWindow):
         elif msg_type == MSG_SCREEN_FRAME:
             if self._screen_guest and self._screen_tab._streaming:
                 self._screen_guest.push_frame_data(payload)
-        elif msg_type in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK):
+        elif msg_type in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
+                          MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP):
             if self._file_manager: self._file_manager.handle_incoming(msg_type, sender_id, payload)
         elif msg_type == MSG_CINEMA_CMD and len(payload) > 0:
             self._handle_cinema_guest(payload)
@@ -637,16 +652,13 @@ class MainWindow(QMainWindow):
         if len(payload) == 0:
             return
         cmd = payload[0]
-        log.log(TAG, f"[HOST-CINEMA] received cmd=0x{cmd:02X} from sender={sender_id}")
         if cmd == CINEMA_PAUSE or cmd == CINEMA_PLAY:
             if self._cinema_host:
                 self._cinema_host.handle_guest_command(cmd, payload)
         elif cmd == CINEMA_SYNC_REQ:
-            log.log(TAG, "[HOST-CINEMA] processing SYNC_REQ, calling _send_sync")
             if self._cinema_host:
                 self._cinema_host.handle_guest_command(cmd, payload)
         elif cmd == CINEMA_JOIN:
-            log.log(TAG, f"[HOST-CINEMA] guest={sender_id} JOIN, host_playing={self._cinema_host.is_playing if self._cinema_host else 'None'}")
             if self._cinema_host and self._cinema_host.is_playing:
                 self._cinema_host.handle_guest_command(CINEMA_SYNC_REQ, b"")
                 self._chat_tab.append_system(f"房客 {sender_id} 加入了观影")
@@ -658,7 +670,6 @@ class MainWindow(QMainWindow):
         if not self._cinema_guest or len(payload) == 0:
             return
         cmd = payload[0]
-        log.log(TAG, f"[GUEST-CINEMA] received cmd=0x{cmd:02X} payload len={len(payload)}")
         self._cinema_guest.handle_host_command(cmd, payload)
 
     def _on_cinema_play(self, file_path: str) -> None:
@@ -726,7 +737,6 @@ class MainWindow(QMainWindow):
             return
         # ★ 先把 VLC 绑定到视频容器窗口
         hwnd = int(self._cinema_tab.get_video_container_widget().winId())
-        log.log(TAG, f"[CINEMA-GUEST] Join clicked, passing hwnd={hwnd} to cinema_guest")
         self._cinema_guest.set_hwnd(hwnd)
         # 发送加入命令
         self._client.send_frame(MSG_CINEMA_CMD, HOST_ID, bytes([CINEMA_JOIN]))

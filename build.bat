@@ -32,7 +32,10 @@ echo.
     --add-data="runtime/plugins;vlc/plugins" ^
     --hidden-import=soundcard ^
     --hidden-import=soundcard._soundcard ^
-    --hidden-import=mss ^
+    --hidden-import=dxcam ^
+    --hidden-import=comtypes ^
+    --hidden-import=comtypes.stream ^
+    --hidden-import=turbojpeg ^
     --hidden-import=cv2 ^
     --hidden-import=numpy ^
     --hidden-import=pyaudio ^

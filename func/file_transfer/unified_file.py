@@ -22,7 +22,7 @@ from PySide6.QtCore import QObject, Signal
 from common import logger as log
 from core.protocol import (
     MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK,
-    MSG_FILE_CHUNK_ACK, HOST_ID
+    MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP, HOST_ID
 )
 import config
 
@@ -44,6 +44,7 @@ class UnifiedFileTransfer(QObject):
     status_changed = Signal(str)
     task_interrupted = Signal(str, str)            # task_id, display_name
     task_removed = Signal(str)
+    file_offer_received = Signal(str, str, str)    # task_id, display_name, size_desc
 
     def __init__(self, my_id: int, send_callback: Callable):
         super().__init__()
@@ -59,6 +60,7 @@ class UnifiedFileTransfer(QObject):
 
         self._recv_tasks = {}
         self._send_tasks = {}
+        self._pending_offers = {}  # task_id -> offer data (等待接收方确认的邀约)
         self._lock = threading.Lock()
 
         self._write_queue = queue.Queue()
@@ -71,7 +73,11 @@ class UnifiedFileTransfer(QObject):
     # 网络层入口 (由 MainWindow 调用)
     # ═════════════════════════════════════════
     def handle_incoming(self, msg_type: int, sender_id: int, payload: bytes):
-        if msg_type == MSG_FILE_TASK_META:
+        if msg_type == MSG_FILE_OFFER:
+            self._on_file_offer(sender_id, payload)
+        elif msg_type == MSG_FILE_OFFER_RESP:
+            self._on_file_offer_resp(sender_id, payload)
+        elif msg_type == MSG_FILE_TASK_META:
             self._on_task_meta(sender_id, payload)
         elif msg_type == MSG_FILE_RESUME_REQ:
             self._on_resume_req(sender_id, payload)
@@ -98,6 +104,7 @@ class UnifiedFileTransfer(QObject):
     def _start_send(self, abs_paths, target_id, is_folder, base_name="", root_path=""):
         task_id = int(time.time() * 1000) & 0xFFFFFFFF
         files = []
+        total_size = 0
         for p in abs_paths:
             try:
                 size = os.path.getsize(p)
@@ -109,7 +116,8 @@ class UnifiedFileTransfer(QObject):
             files.append({"abs": p.replace("\\", "/"), "rel": rel.replace("\\", "/"),
                           "size": size, "fp": fp, "recv": 0, "status": "pending",
                           "chunk_count": (size + config.FILE_CHUNK_SIZE - 1) // config.FILE_CHUNK_SIZE,
-                          "acked_seq": -1})  # 已确认的最大连续序号
+                          "acked_seq": -1})
+            total_size += size
 
         if not files:
             self.status_changed.emit("无可发送的文件")
@@ -119,18 +127,119 @@ class UnifiedFileTransfer(QObject):
                 "is_folder": is_folder, "base_name": base_name, "files": files,
                 "created_at": time.time()}
 
+        # 构建邀约摘要
+        display_name = base_name or os.path.basename(files[0]["abs"])
+        if is_folder:
+            size_desc = f"文件夹 · {len(files)} 个文件"
+        else:
+            size_desc = self._fmt_size(total_size)
+
+        offer = {
+            "task_id": task_id,
+            "sender": self._my_id,
+            "target": target_id,
+            "is_folder": is_folder,
+            "base_name": base_name,
+            "display_name": display_name,
+            "size_desc": size_desc,
+            "total_size": total_size,
+            "file_count": len(files),
+        }
+
+        with self._lock:
+            self._pending_offers[task_id] = {"task": task, "offer": offer}
+
+        self._send_callback(MSG_FILE_OFFER, target_id, json.dumps(offer).encode("utf-8"))
+        display = base_name or os.path.basename(files[0]["abs"])
+        self.status_changed.emit(f"等待 {target_id} 确认接收: {display}...")
+
+    def _on_file_offer(self, sender_id: int, payload: bytes):
+        """接收方：收到发送邀约，弹窗确认"""
+        try:
+            offer = json.loads(payload.decode("utf-8"))
+        except Exception:
+            return
+
+        task_id = str(offer["task_id"])
+        display_name = offer.get("display_name", "未知文件")
+        size_desc = offer.get("size_desc", "")
+
+        # 存储 offer 等待用户响应
+        with self._lock:
+            self._pending_offers[int(offer["task_id"])] = {
+                "offer": offer,
+                "sender_id": sender_id,
+            }
+
+        self.file_offer_received.emit(task_id, display_name, size_desc)
+
+    def respond_to_offer(self, task_id_str: str, accept: bool) -> None:
+        """接收方 UI 调用：接受或拒绝文件邀约"""
+        tid = int(task_id_str)
+        with self._lock:
+            pending = self._pending_offers.pop(tid, None)
+
+        if not pending:
+            return
+
+        offer = pending["offer"]
+        sender_id = pending.get("sender_id", HOST_ID)
+
+        if accept:
+            # 发送接受响应
+            resp = json.dumps({"task_id": tid, "accept": True}).encode("utf-8")
+            self._send_callback(MSG_FILE_OFFER_RESP, sender_id, bytes([0x01]) + resp)
+            self.status_changed.emit(f"已接受: {offer.get('display_name', '')}")
+        else:
+            resp = json.dumps({"task_id": tid, "accept": False}).encode("utf-8")
+            self._send_callback(MSG_FILE_OFFER_RESP, sender_id, bytes([0x00]) + resp)
+            self.status_changed.emit(f"已拒绝: {offer.get('display_name', '')}")
+
+    def _on_file_offer_resp(self, sender_id: int, payload: bytes):
+        """发送方：收到接收方的接受/拒绝响应"""
+        if len(payload) < 2:
+            return
+        accepted = payload[0] == 0x01
+        try:
+            resp = json.loads(payload[1:].decode("utf-8"))
+            task_id = resp["task_id"]
+        except Exception:
+            return
+
+        with self._lock:
+            pending = self._pending_offers.pop(task_id, None)
+
+        if not pending:
+            return
+
+        if not accepted:
+            self.status_changed.emit(f"对方拒绝了传输")
+            self._remove_send_json(task_id)
+            return
+
+        # 接受：恢复正常的任务元数据发送流程
+        task = pending["task"]
         with self._lock:
             self._send_tasks[task_id] = {"task": task, "event": threading.Event(),
                                          "cancelled": False, "ack_event": threading.Event()}
 
-        # 【P0修复】持久化发送任务
         self._save_send_json(task_id)
 
         meta = json.dumps(task).encode("utf-8")
-        self._send_callback(MSG_FILE_TASK_META, target_id, meta)
-        display = base_name or os.path.basename(files[0]["abs"])
-        self.status_changed.emit(f"等待 {target_id} 接收: {display}...")
+        self._send_callback(MSG_FILE_TASK_META, task["target"], meta)
+        display = task.get("base_name") or os.path.basename(task["files"][0]["abs"])
+        self.status_changed.emit(f"对方已接受，开始传输: {display}...")
         threading.Thread(target=self._wait_and_send, args=(task_id,), daemon=True).start()
+
+    @staticmethod
+    def _fmt_size(size: int) -> str:
+        if size >= 1073741824:
+            return f"{size / 1073741824:.1f} GB"
+        if size >= 1048576:
+            return f"{size / 1048576:.1f} MB"
+        if size >= 1024:
+            return f"{size / 1024:.1f} KB"
+        return f"{size} B"
 
     def _wait_and_send(self, task_id: int):
         with self._lock:
