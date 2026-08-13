@@ -46,6 +46,7 @@ class CinemaGuest(QObject):
         self._subtitle_size: int = config.DEFAULT_SUBTITLE_SIZE
         self._sub_file: str = ""
         self._reloading: bool = False
+        self._pending_sub_size: Optional[int] = None  # 重建期间新请求的字号
         self._lock = threading.Lock()
         self._syncing = False
         self._last_sync_time: float = 0.0
@@ -119,12 +120,12 @@ class CinemaGuest(QObject):
                         return
                     if not self._start_player_internal(path):
                         return
-                    self._player.play()
-                    time.sleep(0.2)
-                    self._paused = False
-                    self._syncing = True
-                    self._player.set_time(host_pos)
-                    self._syncing = False
+                    with self._lock:
+                        self._player.play()
+                        self._paused = False
+                        self._syncing = True
+                        self._player.set_time(host_pos)
+                        self._syncing = False
 
             if self._reloading or not self._player or not self._playing:
                 return
@@ -133,13 +134,14 @@ class CinemaGuest(QObject):
                 if host_paused: self._do_pause()
                 else: self._do_play()
 
-            local_pos = self._player.get_time()
-            diff = abs(host_pos - local_pos)
-            if diff > config.CINEMA_SYNC_THRESHOLD * 1000:
-                self._syncing = True
-                self._player.set_time(host_pos)
-                self._syncing = False
-                log.log(TAG, f"Sync corrected: {local_pos}ms → {host_pos}ms (diff={diff}ms)")
+            with self._lock:
+                local_pos = self._player.get_time()
+                diff = abs(host_pos - local_pos)
+                if diff > config.CINEMA_SYNC_THRESHOLD * 1000:
+                    self._syncing = True
+                    self._player.set_time(host_pos)
+                    self._syncing = False
+                    log.log(TAG, f"Sync corrected: {local_pos}ms → {host_pos}ms (diff={diff}ms)")
 
             self._current_total = host_total
             self.position_updated.emit(host_pos, host_total)
@@ -151,39 +153,42 @@ class CinemaGuest(QObject):
         if not self._hwnd:
             log.warn(TAG, "Refusing to create player: hwnd is 0")
             return False
-        self._stop_player()
+        with self._lock:
+            self._stop_player()
         try: import vlc
         except ImportError:
             self.status_changed.emit("VLC库未安装")
             return False
 
         try:
-            self._instance = vlc.Instance("--no-xlib", "--quiet",
-                "--no-video-title-show",
-                f"--freetype-rel-fontsize={self._subtitle_size}")
-            self._player = self._instance.media_player_new()
+            with self._lock:
+                self._instance = vlc.Instance("--no-xlib", "--quiet",
+                    "--no-video-title-show",
+                    f"--freetype-rel-fontsize={self._subtitle_size}")
+                self._player = self._instance.media_player_new()
 
-            if self._hwnd:
-                self._player.set_hwnd(self._hwnd)
+                if self._hwnd:
+                    self._player.set_hwnd(self._hwnd)
 
-            self._current_file_path = file_path
+                self._current_file_path = file_path
 
-            self._sub_file = extract_and_normalize(file_path, self._subtitle_size) or ""
+            sub_file = extract_and_normalize(file_path, self._subtitle_size) or ""
 
-            if self._sub_file and os.path.isfile(self._sub_file):
-                self._media = self._instance.media_new(file_path,
-                    f":sub-file={self._sub_file}")
-                log.log(TAG, f"Loaded external sub: {self._sub_file}")
-            else:
-                self._media = self._instance.media_new(file_path)
+            with self._lock:
+                self._sub_file = sub_file
+                if self._sub_file and os.path.isfile(self._sub_file):
+                    self._media = self._instance.media_new(file_path,
+                        f":sub-file={self._sub_file}")
+                    log.log(TAG, f"Loaded external sub: {self._sub_file}")
+                else:
+                    self._media = self._instance.media_new(file_path)
 
-            self._player.set_media(self._media)
-            self._media.parse()
-            time.sleep(0.3)
+                self._player.set_media(self._media)
+                self._media.parse()
 
-            self._current_total = self._player.get_length()
-            self._playing = True
-            self._paused = True
+                self._current_total = self._player.get_length()
+                self._playing = True
+                self._paused = True
 
             self.status_changed.emit(f"已加载: {self._current_file}")
             log.log(TAG, f"Guest player ready (hwnd={self._hwnd}): {file_path}")
@@ -194,105 +199,182 @@ class CinemaGuest(QObject):
             return False
 
     def _do_play(self) -> None:
-        if self._player and self._playing:
-            try:
-                self._player.play()
-                self._paused = False
-                self.status_changed.emit("播放中")
-            except Exception as e:
-                log.error(TAG, f"Guest play error: {e}")
+        with self._lock:
+            if self._player and self._playing:
+                try:
+                    self._player.play()
+                    self._paused = False
+                    self.status_changed.emit("播放中")
+                except Exception as e:
+                    log.error(TAG, f"Guest play error: {e}")
 
     def _do_pause(self) -> None:
-        if self._player and self._playing:
-            try:
-                self._player.pause()
-                self._paused = True
-                self.status_changed.emit("已暂停")
-            except Exception as e:
-                log.error(TAG, f"Guest pause error: {e}")
+        with self._lock:
+            if self._player and self._playing:
+                try:
+                    self._player.pause()
+                    self._paused = True
+                    self.status_changed.emit("已暂停")
+                except Exception as e:
+                    log.error(TAG, f"Guest pause error: {e}")
 
     def _do_seek(self, position_ms: int) -> None:
-        if self._player and self._playing:
-            try:
-                self._syncing = True
-                self._player.set_time(position_ms)
-                self._syncing = False
-            except Exception as e:
-                self._syncing = False
-                log.error(TAG, f"Guest seek error: {e}")
+        with self._lock:
+            if self._player and self._playing:
+                try:
+                    self._syncing = True
+                    self._player.set_time(position_ms)
+                    self._syncing = False
+                except Exception as e:
+                    self._syncing = False
+                    log.error(TAG, f"Guest seek error: {e}")
 
     def set_subtitle_size(self, size: int, force: bool = False) -> None:
+        """异步重建字幕（FFmpeg + VLC 重建放后台线程，避免阻塞 UI）。"""
         if not self._player or not self._playing: return
         if size == self._subtitle_size and not force: return
+        if self._reloading:
+            # 重建进行中：记录最新请求，重建完成后自动应用
+            self._pending_sub_size = size
+            return
 
-        self._subtitle_size = size
         self._reloading = True
+        self._subtitle_size = size
+        self._pending_sub_size = None
         log.log(TAG, f"Subtitle size → {size}" + (" (force)" if force else ""))
 
-        try:
+        with self._lock:
             was_paused = self._paused
             pos = self._player.get_time()
             if pos < 0: pos = 0
             active_spu = self._player.video_get_spu()
 
-            self._sub_file = extract_and_normalize(self._current_file_path, size) or ""
+        threading.Thread(
+            target=self._rebuild_subtitle,
+            args=(size, pos, was_paused, active_spu),
+            daemon=True, name="CinemaSubtitleRebuild"
+        ).start()
 
-            self._player.stop()
-            self._instance.release()
-            self._instance = None
+    def _rebuild_subtitle(self, size: int, pos: int, was_paused: bool, active_spu: int) -> None:
+        try:
+            sub_file = extract_and_normalize(self._current_file_path, size) or ""
+            with self._lock:
+                if not self._playing or not self._current_file_path:
+                    return
+                self._sub_file = sub_file
+                self._rebuild_player_locked()
+                if self._sub_file and os.path.isfile(self._sub_file):
+                    self._media = self._instance.media_new(self._current_file_path,
+                        f":sub-file={self._sub_file}")
+                else:
+                    self._media = self._instance.media_new(self._current_file_path)
 
-            import vlc
-            self._instance = vlc.Instance("--no-xlib", "--quiet",
-                "--no-video-title-show",
-                f"--freetype-rel-fontsize={size}")
-            self._player = self._instance.media_player_new()
-            if self._hwnd:
-                self._player.set_hwnd(self._hwnd)
-
-            if self._sub_file and os.path.isfile(self._sub_file):
-                self._media = self._instance.media_new(self._current_file_path,
-                    f":sub-file={self._sub_file}")
-            else:
-                self._media = self._instance.media_new(self._current_file_path)
-
-            self._player.set_media(self._media)
-            self._media.parse()
-            time.sleep(0.2)
-
-            self._player.play()
-            time.sleep(0.5)
-            if active_spu >= 0:
-                self._player.video_set_spu(active_spu)
-            self._player.set_time(pos)
-
-            if was_paused: self._player.pause()
+                self._player.set_media(self._media)
+                self._media.parse()
+                self._player.play()
+                if active_spu >= 0:
+                    self._player.video_set_spu(active_spu)
+                self._player.set_time(pos)
+                if was_paused:
+                    self._player.pause()
             self.status_changed.emit(f"字幕大小: {size}")
         except Exception as e:
             log.error(TAG, f"Subtitle resize error: {e}")
         finally:
             self._reloading = False
+            pending = self._pending_sub_size
+            if pending is not None and pending != self._subtitle_size:
+                self._pending_sub_size = None
+                self.set_subtitle_size(pending)
+
+    def rebind_hwnd(self) -> None:
+        """HWND 变化（进入/退出全屏）后重建 player，复用已有字幕文件，不重新提取。"""
+        if not self._player or not self._playing: return
+        if self._reloading: return
+
+        self._reloading = True
+        with self._lock:
+            pos = self._player.get_time()
+            if pos < 0: pos = 0
+            was_paused = self._paused
+            active_spu = self._player.video_get_spu()
+
+        threading.Thread(
+            target=self._rebind_hwnd_worker,
+            args=(pos, was_paused, active_spu),
+            daemon=True, name="CinemaRebindHwnd"
+        ).start()
+
+    def _rebind_hwnd_worker(self, pos: int, was_paused: bool, active_spu: int) -> None:
+        try:
+            with self._lock:
+                if not self._playing or not self._current_file_path:
+                    return
+                self._rebuild_player_locked()
+                sub_file = self._sub_file
+                if sub_file and os.path.isfile(sub_file):
+                    self._media = self._instance.media_new(self._current_file_path,
+                        f":sub-file={sub_file}")
+                else:
+                    self._media = self._instance.media_new(self._current_file_path)
+
+                self._player.set_media(self._media)
+                self._media.parse()
+                self._player.play()
+                if active_spu >= 0:
+                    self._player.video_set_spu(active_spu)
+                self._player.set_time(pos)
+                if was_paused:
+                    self._player.pause()
+        except Exception as e:
+            log.error(TAG, f"Rebind hwnd error: {e}")
+        finally:
+            self._reloading = False
+
+    def _rebuild_player_locked(self) -> None:
+        """在持有 self._lock 的前提下重建 VLC instance/player（保留 _hwnd）。"""
+        import vlc
+        if self._player:
+            try: self._player.stop()
+            except Exception: pass
+            self._player = None
+        if self._instance:
+            try: self._instance.release()
+            except Exception: pass
+            self._instance = None
+        self._instance = vlc.Instance("--no-xlib", "--quiet",
+            "--no-video-title-show",
+            f"--freetype-rel-fontsize={self._subtitle_size}")
+        self._player = self._instance.media_player_new()
+        if self._hwnd:
+            self._player.set_hwnd(self._hwnd)
 
     def set_subtitle_track(self, track_id: int) -> None:
-        if self._player and self._playing:
-            try:
-                self._player.video_set_spu(track_id)
-                log.log(TAG, f"SPU track → {track_id}")
-            except Exception as e:
-                log.error(TAG, f"Set SPU error: {e}")
+        if self._reloading: return
+        with self._lock:
+            if self._player and self._playing:
+                try:
+                    self._player.video_set_spu(track_id)
+                    log.log(TAG, f"SPU track → {track_id}")
+                except Exception as e:
+                    log.error(TAG, f"Set SPU error: {e}")
 
     def get_spu_tracks(self) -> list[tuple[int, str]]:
-        if not self._player: return []
-        try:
-            desc = self._player.video_get_spu_description()
-            return [(desc.at(i).id, desc.at(i).name.decode("utf-8", errors="replace"))
-                    for i in range(desc.count)]
-        except Exception: return []
+        if self._reloading: return []
+        with self._lock:
+            if not self._player: return []
+            try:
+                desc = self._player.video_get_spu_description()
+                return [(desc.at(i).id, desc.at(i).name.decode("utf-8", errors="replace"))
+                        for i in range(desc.count)]
+            except Exception: return []
 
     def _do_stop(self) -> None:
-        self._stop_player()
-        self._playing = False
-        self._paused = False
-        self._current_file = ""
+        with self._lock:
+            self._stop_player()
+            self._playing = False
+            self._paused = False
+            self._current_file = ""
         self.status_changed.emit("观影已结束")
 
     def _stop_player(self) -> None:
@@ -318,13 +400,17 @@ class CinemaGuest(QObject):
     def cleanup(self) -> None: self.stop()
 
     def get_current_position(self) -> int:
-        if self._player and self._playing:
-            try: return self._player.get_time()
-            except Exception: pass
+        if self._reloading: return 0
+        with self._lock:
+            if self._player and self._playing:
+                try: return self._player.get_time()
+                except Exception: pass
         return 0
 
     def get_total_length(self) -> int:
-        if self._player and self._playing:
-            try: return self._player.get_length()
-            except Exception: pass
+        if self._reloading: return 0
+        with self._lock:
+            if self._player and self._playing:
+                try: return self._player.get_length()
+                except Exception: pass
         return self._current_total

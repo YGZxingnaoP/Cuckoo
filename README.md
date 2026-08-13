@@ -49,6 +49,14 @@
 
 ---
 
+## 界面预览
+
+<div align="center">
+  <img src="screenshot.png" alt="Cuckoo 主界面" style="max-width: 100%; border-radius: 8px;" />
+</div>
+
+---
+
 ## 技术亮点
 
 ### 投屏 — DirectX + libjpeg-turbo

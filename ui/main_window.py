@@ -169,6 +169,7 @@ class MainWindow(QMainWindow):
         self._cinema_tab.subtitle_size_changed.connect(self._on_subtitle_size_changed)
         self._cinema_tab.subtitle_extract_requested.connect(self._on_subtitle_extract)
         self._cinema_tab.spu_track_changed.connect(self._on_spu_track_changed)
+        self._cinema_tab.local_progress_poll.connect(self._on_local_progress_poll)
         
         if self._is_host:
             self._screen_tab.share_audio_toggled.connect(self._on_share_audio_toggled)
@@ -786,13 +787,14 @@ class MainWindow(QMainWindow):
         if hwnd == 0:
             log.warn(TAG, "HWND is 0, skipping VLC rebind")
             return
-        # 必须先更新 hwnd 再 force 重建，否则 VLC 绑定到旧 HWND
+        # 必须先更新 hwnd 再重建，否则 VLC 绑定到旧 HWND；
+        # 用 rebind_hwnd 复用已有字幕文件，不重新跑 FFmpeg 提取，避免卡顿。
         if self._is_host and self._cinema_host:
             self._cinema_host._hwnd = hwnd
-            self._cinema_host.set_subtitle_size(self._cinema_host._subtitle_size, force=True)
+            self._cinema_host.rebind_hwnd()
         elif self._cinema_guest:
             self._cinema_guest._hwnd = hwnd
-            self._cinema_guest.set_subtitle_size(self._cinema_guest._subtitle_size, force=True)
+            self._cinema_guest.rebind_hwnd()
         QTimer.singleShot(2000, self._refresh_cinema_spu_tracks)
 
     def _on_subtitle_size_changed(self, size: int) -> None:
@@ -815,6 +817,17 @@ class MainWindow(QMainWindow):
             self._cinema_host.set_subtitle_track(track_id)
         elif self._cinema_guest:
             self._cinema_guest.set_subtitle_track(track_id)
+
+    def _on_local_progress_poll(self) -> None:
+        """每 500ms 拉取本地播放位置，刷新进度条（避免进度条 5 秒才动一次）"""
+        if self._is_host and self._cinema_host:
+            pos = self._cinema_host.get_current_position()
+            total = self._cinema_host.get_total_length()
+            self._cinema_tab.update_position(pos, total)
+        elif self._cinema_guest:
+            pos = self._cinema_guest.get_current_position()
+            total = self._cinema_guest.get_total_length()
+            self._cinema_tab.update_position(pos, total)
 
     def _refresh_cinema_spu_tracks(self) -> None:
         """刷新字幕轨道下拉框"""

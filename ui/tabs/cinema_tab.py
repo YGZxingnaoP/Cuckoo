@@ -70,6 +70,7 @@ class CinemaTab(QWidget):
     subtitle_size_changed = Signal(int)    # 10-40
     subtitle_extract_requested = Signal()   # 提取字幕按钮
     spu_track_changed = Signal(int)          # 字幕轨道切换
+    local_progress_poll = Signal()          # 本地进度条刷新请求
 
     def __init__(self, is_host: bool, parent=None):
         super().__init__(parent)
@@ -617,9 +618,8 @@ class CinemaTab(QWidget):
                 self.play_requested.emit(path)
 
     def _on_progress_tick(self) -> None:
-        """定时器触发：通知外部更新进度"""
-        # 实际进度由外部通过 update_position() 更新
-        pass
+        """定时器触发：通知外部拉取当前播放位置，刷新本地进度条"""
+        self.local_progress_poll.emit()
 
     @property
     def is_fullscreen(self) -> bool:
