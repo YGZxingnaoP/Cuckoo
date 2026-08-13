@@ -67,12 +67,12 @@ def sanitize_rel_path(rel: str) -> str:
 
 
 def is_large_file(fi: dict) -> bool:
-    """判断是否为需要启用可靠传输的大文件（≥2GB）"""
+    """判断是否为大文件（≥2GB，启用位图随机写 + chunk 重传）"""
     return fi.get("size", 0) >= config.LARGE_FILE_THRESHOLD
 
 
 def calc_file_md5(path: str) -> str:
-    """流式计算文件 MD5（大文件安全）"""
+    """流式计算文件 MD5（避免整文件读入内存）"""
     md5 = hashlib.md5()
     try:
         with open(path, "rb") as f:

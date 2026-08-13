@@ -13,7 +13,7 @@ from typing import Optional, Callable
 from common import logger as log
 from core.protocol import (
     build_frame, read_frame, BROADCAST_ID, HOST_ID,
-    MSG_TEXT, MSG_FILE_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
+    MSG_TEXT, MSG_FILE_META, MSG_FILE_RESUME_REQ,
     MSG_FILE_TASK_META, MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK, MSG_SCREEN_FRAME,
     MSG_COMMAND, MSG_VOICE, MSG_CINEMA_CMD,
     MSG_FILE_OFFER, MSG_FILE_OFFER_RESP, MSG_FILE_CANCEL,
@@ -151,11 +151,14 @@ class Server:
 
             try:
                 voice_sock.settimeout(5.0)
-                uid_bytes = voice_sock.recv(4)
-                if not uid_bytes or len(uid_bytes) < 4:
-                    voice_sock.close()
-                    continue
-                uid = struct.unpack("!I", uid_bytes)[0]
+                # 【bug修复】recv(4) 可能因 TCP 分包只返回 1~3 字节，必须精确读取 4 字节
+                uid_buf = bytearray()
+                while len(uid_buf) < 4:
+                    chunk = voice_sock.recv(4 - len(uid_buf))
+                    if not chunk:
+                        raise ConnectionError("Voice connection closed during UID handshake")
+                    uid_buf.extend(chunk)
+                uid = struct.unpack("!I", bytes(uid_buf))[0]
                 voice_sock.settimeout(None)
             except Exception as e:
                 log.error(TAG, f"Voice uid identification failed: {e}")
@@ -360,7 +363,7 @@ class Server:
             # 蓄水池在上游已把在途数据限制在 32MB，而 file_queue 容量 128MB，
             # 因此正常不会满；即使极端拥塞满，阻塞也让发送方自然减速。
             target_q, can_drop = info.file_queue, "block"
-        elif msg_type in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK_ACK,
+        elif msg_type in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_CHUNK_ACK,
                           MSG_FILE_OFFER, MSG_FILE_OFFER_RESP, MSG_FILE_CANCEL,
                           MSG_FILE_RETRANSMIT_REQ, MSG_FILE_VERIFY):
             # 控制消息：小体积，非阻塞入队（可能被 UI 线程调用，不能卡 UI）。

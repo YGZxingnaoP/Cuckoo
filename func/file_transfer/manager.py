@@ -12,12 +12,12 @@ import copy
 import threading
 import time
 import hashlib
-from typing import Callable
+from typing import Callable, Optional
 
 from PySide6.QtCore import QObject, Signal
 from common import logger as log
 from core.protocol import (
-    MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
+    MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ,
     MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP,
     MSG_FILE_CANCEL, MSG_FILE_RETRANSMIT_REQ, MSG_FILE_VERIFY, HOST_ID,
 )
@@ -82,7 +82,6 @@ class UnifiedFileTransfer(QObject):
             MSG_FILE_OFFER_RESP:      self._handle_offer_resp,
             MSG_FILE_TASK_META:       self._handle_task_meta,
             MSG_FILE_RESUME_REQ:      self._handle_resume_req,
-            MSG_FILE_RESUME_ACK:      self._handle_resume_ack,
             MSG_FILE_CHUNK:           self._handle_chunk,
             MSG_FILE_CHUNK_ACK:       self._handle_ack,
             MSG_FILE_CANCEL:          self._handle_cancel,
@@ -218,6 +217,9 @@ class UnifiedFileTransfer(QObject):
             self._send_tasks.clear()
             self._meta_buffers.clear()
             self._resume_buffers.clear()
+            # 【bug修复】清理未决邀约缓冲，避免退出/重进房间时残留
+            self._received_offers.clear()
+            self._pending_offers.clear()
         if self._recv_worker:
             self._recv_worker.stop()
 
@@ -377,13 +379,32 @@ class UnifiedFileTransfer(QObject):
         return entry
 
     @staticmethod
-    def _rebuild_file_entry(f: dict) -> dict:
-        """接收端重建完整文件条目（补齐运行时字段）"""
+    def _rebuild_file_entry(f: dict) -> Optional[dict]:
+        """接收端重建完整文件条目（补齐运行时字段）。
+
+        返回 None 表示该条目非法（路径穿越 / 非法大小），应被丢弃。
+        """
+        # 【安全修复】接收侧必须校验相对路径，防止对端注入 "../" 导致越界写盘
+        try:
+            rel = sanitize_rel_path(f.get("rel", ""))
+        except ValueError as e:
+            log.warn(TAG, f"Rejecting file entry (path traversal): {e}")
+            return None
+
+        if not rel or rel == ".":
+            log.warn(TAG, "Rejecting file entry (empty rel path)")
+            return None
+
+        size = f.get("size", 0)
+        if not isinstance(size, int) or size < 0:
+            log.warn(TAG, f"Rejecting file entry (invalid size): {size!r}")
+            return None
+
         entry = {
-            "rel": f["rel"],
-            "size": f["size"],
-            "fp": f["fp"],
-            "chunk_count": f["chunk_count"],
+            "rel": rel,
+            "size": size,
+            "fp": f.get("fp", ""),
+            "chunk_count": f.get("chunk_count", 0),
             "recv": 0,
             "status": "pending",
             "acked_seq": -1,
@@ -471,8 +492,20 @@ class UnifiedFileTransfer(QObject):
         if not rel:
             rel = f"file_{fi.get('fp', 'unknown')}"
         if base:
-            return os.path.join(self._base_dir, base, rel + ".part")
-        return os.path.join(self._base_dir, rel + ".part")
+            target = os.path.join(self._base_dir, base, rel + ".part")
+        else:
+            target = os.path.join(self._base_dir, rel + ".part")
+
+        # 【安全修复】最终兜底：确保拼接结果不越出下载目录（防御任意文件写入）
+        base_abs = os.path.abspath(self._base_dir)
+        target_abs = os.path.abspath(target)
+        try:
+            relp = os.path.relpath(target_abs, base_abs)
+        except ValueError:
+            raise ValueError(f"Path escapes download dir: {target}")
+        if relp == ".." or relp.startswith(".." + os.sep):
+            raise ValueError(f"Path escapes download dir: {target}")
+        return target
 
     def _load_interrupted_tasks(self) -> None:
         tasks = self._store.load_recv_tasks()
@@ -575,33 +608,53 @@ class UnifiedFileTransfer(QObject):
                 full_meta = []
                 for i in range(buf["batch_count"]):
                     full_meta.extend(buf["batches"].get(i, []))
-                task["files"] = [self._rebuild_file_entry(f) for f in full_meta]
 
-                # 续传恢复：从旧任务继承大文件 received_seqs
-                old = self._recv_tasks.get(tid)
-                if old:
-                    old_map = {f["fp"]: f for f in old["files"]}
-                    for rf in task["files"]:
-                        old_fi = old_map.get(rf["fp"])
-                        if old_fi is not None:
-                            if is_large_file(rf):
-                                old_bs = old_fi.get("received_seqs")
-                                rf["received_seqs"] = old_bs if isinstance(old_bs, _BitSet) else _BitSet(rf["chunk_count"])
-                                rf["recv"] = min(rf["received_seqs"].count() * config.FILE_CHUNK_SIZE, rf["size"])
-                            else:
-                                # 【bug修复】小文件续传：已完成文件 .part 已 rename 走，
-                                # 需检查正式文件是否存在且大小正确，避免误判为未接收而重发。
-                                part_path = self._build_part_path(rf, task)
-                                final_path = part_path[:-5] if part_path.endswith(".part") else part_path
-                                if os.path.exists(final_path) and os.path.getsize(final_path) == rf["size"]:
-                                    rf["recv"] = rf["size"]
-                                    rf["status"] = "completed"
+                # 【安全修复】校验并过滤非法文件条目（路径穿越 / 非法大小）
+                files = []
+                for f in full_meta:
+                    entry = self._rebuild_file_entry(f)
+                    if entry is not None:
+                        files.append(entry)
+                task["files"] = files
+
+                # 【安全修复】校验 base_name，防止 "../" 越界
+                base_name = task.get("base_name", "")
+                if base_name:
+                    try:
+                        task["base_name"] = sanitize_rel_path(base_name)
+                    except ValueError as e:
+                        log.warn(TAG, f"Rejecting task base_name: {e}")
+                        task["base_name"] = ""
+
+                if not task["files"]:
+                    log.warn(TAG, f"Task {tid} has no valid files, discarding")
+                    del self._meta_buffers[tid]
+                else:
+                    # 续传恢复：从旧任务继承大文件 received_seqs
+                    old = self._recv_tasks.get(tid)
+                    if old:
+                        old_map = {f["fp"]: f for f in old["files"]}
+                        for rf in task["files"]:
+                            old_fi = old_map.get(rf["fp"])
+                            if old_fi is not None:
+                                if is_large_file(rf):
+                                    old_bs = old_fi.get("received_seqs")
+                                    rf["received_seqs"] = old_bs if isinstance(old_bs, _BitSet) else _BitSet(rf["chunk_count"])
+                                    rf["recv"] = min(rf["received_seqs"].count() * config.FILE_CHUNK_SIZE, rf["size"])
                                 else:
-                                    rf["recv"] = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+                                    # 【bug修复】小文件续传：已完成文件 .part 已 rename 走，
+                                    # 需检查正式文件是否存在且大小正确，避免误判为未接收而重发。
+                                    part_path = self._build_part_path(rf, task)
+                                    final_path = part_path[:-5] if part_path.endswith(".part") else part_path
+                                    if os.path.exists(final_path) and os.path.getsize(final_path) == rf["size"]:
+                                        rf["recv"] = rf["size"]
+                                        rf["status"] = "completed"
+                                    else:
+                                        rf["recv"] = os.path.getsize(part_path) if os.path.exists(part_path) else 0
 
-                self._recv_tasks[tid] = task
-                del self._meta_buffers[tid]
-                assembled = task
+                    self._recv_tasks[tid] = task
+                    del self._meta_buffers[tid]
+                    assembled = task
 
         if assembled is None:
             return
@@ -638,11 +691,12 @@ class UnifiedFileTransfer(QObject):
                         fi["_missing_seqs"] = None
                         fi["status"] = "completed"  # 已完整，无需重发
             else:
-                # 【bug修复】小文件续传：仅当 size > 0 且 recv >= size 时标记 completed。
-                # 空文件（size=0）必须正常发送 EOF，不能标记 completed，
-                # 否则发送端会跳过，接收端永远收不到空文件。
-                if not is_large_file(fi) and fi.get("size", 0) > 0 and fi.get("recv", 0) >= fi.get("size", 0):
-                    fi["status"] = "completed"
+                # 【bug修复】小文件续传：不再因 recv>=size 直接标记 completed。
+                # 此时接收端 .part 可能已完整但尚未经过 MD5 校验，直接跳过会导致
+                # 接收端收不到 EOF+VERIFY 而无法完成校验与最终落盘。
+                # 保持 pending，由 _send_one_file 对"数据已完整"的小文件
+                # 仅补发 EOF + VERIFY（不重发数据块），完成校验。
+                pass
 
     def _handle_resume_req(self, sender_id: int, payload: bytes) -> None:
         try:
@@ -749,9 +803,6 @@ class UnifiedFileTransfer(QObject):
         self._rebuild_send_worker(tid, task)
         log.log(TAG, f"_restore_send_worker: restored tid={tid}, {len(task['files'])} files")
 
-    def _handle_resume_ack(self, sender_id: int, payload: bytes) -> None:
-        pass
-
     def _handle_chunk(self, sender_id: int, payload: bytes) -> None:
         if len(payload) < CHUNK_HEADER.size:
             return
@@ -773,7 +824,11 @@ class UnifiedFileTransfer(QObject):
                 fi["eof_received"] = True
             # 不做 seq 去重：大文件随机写幂等，重复写无副作用；去重会破坏重传
 
-            part_path = self._build_part_path(fi, task)
+            try:
+                part_path = self._build_part_path(fi, task)
+            except ValueError as e:
+                log.error(TAG, f"Rejecting chunk due to invalid path: {e}")
+                return
 
         self._recv_worker.enqueue((tid, idx, part_path, seq, data if not is_eof else b"", fi, task))
 
@@ -828,7 +883,11 @@ class UnifiedFileTransfer(QObject):
                 return
             fi = task["files"][file_idx]
             fi["expected_md5"] = md5
-            part_path = self._build_part_path(fi, task)
+            try:
+                part_path = self._build_part_path(fi, task)
+            except ValueError as e:
+                log.error(TAG, f"Rejecting verify due to invalid path: {e}")
+                return
 
         self._recv_worker.enqueue((tid, file_idx, part_path, EOF_SEQ, b"", fi, task))
 

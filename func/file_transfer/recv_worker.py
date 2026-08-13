@@ -3,7 +3,7 @@
 接收写盘工作线程
 ───────────────────────────────────────────
 全局单例接收写盘线程：大文件按 seq 随机写，小文件追加写。
-大文件 seq 完整性检查 + MD5 校验 + 重传请求。
+非空文件 MD5 校验；大文件额外做 seq 完整性检查 + 重传请求。
 """
 
 import os
@@ -220,13 +220,14 @@ class _RecvWorker:
         log.log(TAG, f"Recv: sent retransmit req for file idx={idx}, {len(seqs)} chunks in {batches} batch(es)")
 
     def _check_file_complete(self, tid: int, idx: int, target_path: str, fi: dict, task: dict) -> None:
-        """检查文件是否完成。大文件需要 seq 完整 + MD5 校验通过。"""
+        """检查文件是否完成。非空文件需 MD5 校验通过，大文件还需 seq 完整。"""
         with self._lock:
             eof = bool(fi.get("eof_received"))
             if not eof:
                 return
             large = is_large_file(fi)
             already_done = (fi.get("status") == "completed")
+            size = fi.get("size", 0)
             if large:
                 total_chunks = fi.get("chunk_count", 0)
                 bs = fi.get("received_seqs")
@@ -235,18 +236,16 @@ class _RecvWorker:
                     fi["received_seqs"] = bs
                 data_complete = bs.is_complete()
                 missing = bs.missing() if not data_complete else []
-                md5_ready = bool(fi.get("expected_md5"))
-                md5_verified = bool(fi.get("md5_verified"))
-                retransmit_round = fi.get("retransmit_round", 0)
-                expected_md5 = fi.get("expected_md5", "")
+                need_md5 = True
             else:
                 total_chunks = 0
                 missing = []
-                data_complete = fi.get("recv", 0) >= fi.get("size", 0)
-                md5_ready = True
-                md5_verified = True  # 小文件无需 MD5
-                retransmit_round = 0
-                expected_md5 = ""
+                data_complete = fi.get("recv", 0) >= size
+                need_md5 = size > 0  # 空文件无需 MD5
+            md5_ready = bool(fi.get("expected_md5"))
+            md5_verified = bool(fi.get("md5_verified"))
+            retransmit_round = fi.get("retransmit_round", 0)
+            expected_md5 = fi.get("expected_md5", "")
 
         if already_done:
             return
@@ -264,12 +263,12 @@ class _RecvWorker:
                 log.error(TAG, f"Recv: file idx={idx} still missing {len(missing)} chunks after {config.MAX_RETRANSMIT_ROUNDS} rounds")
             return
 
-        # ── 数据完整但 MD5 未就绪（等待 VERIFY） ──
-        if large and not md5_ready:
+        # ── 需要 MD5 但尚未就绪（等待 VERIFY） ──
+        if need_md5 and not md5_ready:
             return
 
-        # ── 大文件 MD5 校验 ──
-        if large and not md5_verified:
+        # ── MD5 校验 ──
+        if need_md5 and not md5_verified:
             # 校验前先 flush + close 写句柄，确保数据落盘
             self.close_handle(target_path)
             actual = calc_file_md5(target_path)
@@ -280,7 +279,7 @@ class _RecvWorker:
                 # 校验通过后继续到 _finalize_file
             else:
                 log.error(TAG, f"Recv: MD5 mismatch for file idx={idx} (expected={expected_md5[:16]} actual={actual[:16]})")
-                if retransmit_round < config.MAX_RETRANSMIT_ROUNDS:
+                if large and retransmit_round < config.MAX_RETRANSMIT_ROUNDS:
                     with self._lock:
                         fi["retransmit_round"] = retransmit_round + 1
                         bs = fi.get("received_seqs")
@@ -299,6 +298,23 @@ class _RecvWorker:
                     except OSError as e:
                         log.warn(TAG, f"Remove corrupted part failed: {e}")
                     log.log(TAG, f"Recv: request full retransmit for file idx={idx} (MD5 mismatch)")
+                    return
+                elif not large:
+                    # 小文件无 seq 重传通道：重置进度并删除损坏 part，等待用户重新续传
+                    self.close_handle(target_path)
+                    try:
+                        if os.path.exists(target_path):
+                            os.remove(target_path)
+                    except OSError as e:
+                        log.warn(TAG, f"Remove corrupted part failed: {e}")
+                    with self._lock:
+                        fi["recv"] = 0
+                        fi["acked_seq"] = -1
+                        fi["status"] = "pending"
+                        fi["md5_verified"] = False
+                        fi["expected_md5"] = None
+                    self._on_status.emit(f"文件校验失败，请重新接收: {fi.get('rel', '')}")
+                    log.log(TAG, f"Recv: small file idx={idx} reset for re-receive (MD5 mismatch)")
                     return
                 else:
                     log.error(TAG, f"Recv: MD5 still mismatch after {config.MAX_RETRANSMIT_ROUNDS} rounds")

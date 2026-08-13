@@ -17,7 +17,7 @@ from core.client import ClientConnection
 from core.protocol import (
     NicknameRegistry, MSG_TEXT, MSG_SCREEN_FRAME, MSG_COMMAND, MSG_VOICE,
     CMD_SCREEN_START, CMD_SCREEN_STOP, HOST_ID, BROADCAST_ID, build_frame,
-    MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK, MSG_FILE_CHUNK,
+    MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_CHUNK,
     MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP, MSG_FILE_CANCEL,
     MSG_FILE_RETRANSMIT_REQ, MSG_FILE_VERIFY, MSG_CINEMA_CMD,
     CINEMA_PLAY, CINEMA_PAUSE, CINEMA_SEEK, CINEMA_SYNC, CINEMA_STOP,
@@ -230,7 +230,7 @@ class MainWindow(QMainWindow):
             self._server.register_handler(MSG_VOICE, self._handle_voice)
             
             # 注册文件处理器 (透明中转 + 本地处理)
-            for msg_t in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
+            for msg_t in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ,
                           MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP,
                           MSG_FILE_CANCEL, MSG_FILE_RETRANSMIT_REQ, MSG_FILE_VERIFY):
                 self._server.register_handler(msg_t, self._handle_file)
@@ -404,7 +404,7 @@ class MainWindow(QMainWindow):
         elif msg_type == MSG_SCREEN_FRAME:
             if self._screen_guest and self._screen_tab._streaming:
                 self._screen_guest.push_frame_data(payload)
-        elif msg_type in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ, MSG_FILE_RESUME_ACK,
+        elif msg_type in (MSG_FILE_TASK_META, MSG_FILE_RESUME_REQ,
                           MSG_FILE_CHUNK, MSG_FILE_CHUNK_ACK, MSG_FILE_OFFER, MSG_FILE_OFFER_RESP,
                           MSG_FILE_CANCEL, MSG_FILE_RETRANSMIT_REQ, MSG_FILE_VERIFY):
             if self._file_manager: self._file_manager.handle_incoming(msg_type, sender_id, payload)

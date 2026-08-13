@@ -3,7 +3,7 @@
 发送工作线程
 ───────────────────────────────────────────
 单个发送任务的 worker：分块读取 → 蓄水池流控 → 发送 chunk → 收集 ACK。
-大文件额外：流式 MD5 → VERIFY → 响应重传请求。
+非空文件：MD5 → VERIFY；大文件额外：响应重传请求。
 """
 
 import json
@@ -29,7 +29,7 @@ from func.file_transfer.common import (
 class _SendWorker:
     """
     单个发送任务的 worker。
-    发送 chunk → 流式 MD5（大文件）→ EOF → VERIFY → 响应重传请求。
+    发送 chunk → MD5 → EOF → VERIFY；大文件额外响应重传请求。
     """
 
     def __init__(
@@ -59,10 +59,12 @@ class _SendWorker:
         self._resume_ready = threading.Event()
         # 重传请求队列: (file_idx, seqs)
         self._retransmit_queue: queue.Queue = queue.Queue()
-        # 大文件的 MD5（重传时需重发 VERIFY）
+        # 文件的 MD5（重传时需重发 VERIFY）
         self._file_md5s: dict[int, str] = {}
         # 是否成功完成（所有文件 ACK 确认）。失败时保留任务供断点续传。
         self._success = False
+        # ACK/重传活动时间戳（用于空闲超时判定，替代固定总超时）
+        self._last_activity = time.time()
 
     def signal_resume_ready(self) -> None:
         self._resume_ready.set()
@@ -78,6 +80,7 @@ class _SendWorker:
                 fi = self._files[file_idx]
                 if acked_seq > fi.get("acked_seq", -1):
                     fi["acked_seq"] = acked_seq
+                    self._last_activity = time.time()
         if self._all_files_acked():
             self._all_acked.set()
 
@@ -136,8 +139,8 @@ class _SendWorker:
             if md5_hash is None:
                 return  # 取消或错误
 
-            # 大文件：发送 MD5 校验值，并保存以便重传时重发
-            if is_large_file(fi) and md5_hash:
+            # 所有非空文件：发送 MD5 校验值，并保存以便重传时重发
+            if md5_hash:
                 self._file_md5s[idx] = md5_hash
                 verify = json.dumps({"task_id": self._tid, "file_idx": idx, "md5": md5_hash}).encode()
                 self._send_cb(MSG_FILE_VERIFY, self._target, verify)
@@ -164,20 +167,31 @@ class _SendWorker:
         return True
 
     def _send_one_file(self, idx: int, fi: dict, t0: float) -> Optional[str]:
-        """发送单个文件的 chunk + EOF。返回 MD5（大文件）或空字符串。"""
-        md5 = hashlib.md5() if is_large_file(fi) else None
+        """发送单个文件的 chunk + EOF。返回 MD5（非空文件）或空字符串。"""
+        size = fi.get("size", 0)
+        need_md5 = size > 0
+        md5 = hashlib.md5() if need_md5 else None
         total_chunks = fi.get("chunk_count", 0)
 
         if total_chunks == 0:
+            # 空文件：只需发送 EOF
             header = CHUNK_HEADER.pack(self._tid, idx, EOF_SEQ)
             self._send_cb(MSG_FILE_CHUNK, self._target, header)
             fi["status"] = "sent"
-            return md5.hexdigest() if md5 else ""
+            return ""
 
         # ── 大文件续传：只发送缺失的 seq（随机 seek），幂等补全 ──
         missing = fi.get("_missing_seqs")
         if missing is not None and is_large_file(fi):
             return self._send_missing_chunks(idx, fi, missing)
+
+        # ── 小文件续传且数据已完整：只补发 EOF + VERIFY，不重发数据块 ──
+        if fi.get("recv", 0) >= size > 0:
+            header = CHUNK_HEADER.pack(self._tid, idx, EOF_SEQ)
+            self._send_cb(MSG_FILE_CHUNK, self._target, header)
+            fi["status"] = "sent"
+            log.log(TAG, f"Send: file idx={idx} already complete, resending EOF+VERIFY")
+            return calc_file_md5(fi["abs"])
 
         start_chunk = fi.get("recv", 0) // config.FILE_CHUNK_SIZE
 
@@ -219,6 +233,12 @@ class _SendWorker:
             self._send_cb(MSG_FILE_CHUNK, self._target, header)
             fi["status"] = "sent"
             log.log(TAG, f"Send: file idx={idx} sent, {fi['recv']} bytes")
+
+            # 续传场景：流式 MD5 只覆盖后半部分，需重新计算完整文件 MD5。
+            # 注意必须用 recv 而非 start_chunk 判断：recv 可能小于一个 chunk
+            # （如 65535 字节），此时 start_chunk 仍为 0，但流式 MD5 已不完整。
+            if need_md5 and fi.get("recv", 0) > 0:
+                return calc_file_md5(fi["abs"])
             return md5.hexdigest() if md5 else ""
 
         except FileNotFoundError:
@@ -273,17 +293,24 @@ class _SendWorker:
             return None
 
     def _retransmit_loop(self) -> None:
-        """响应重传请求，直到全部文件确认完成或超时"""
-        timeout = max(60, config.FILE_ACK_FINAL_TIMEOUT)
-        deadline = time.time() + timeout
+        """响应重传请求，直到全部文件确认完成或空闲超时。
 
-        while time.time() < deadline:
+        使用"空闲超时"而非固定总超时：只要仍有 ACK 或重传活动，就一直等待，
+        避免超大文件 / 慢速接收端在固定 60 秒后被误判为"部分未确认"。
+        """
+        self._last_activity = time.time()
+        idle_timeout = config.FILE_ACK_FINAL_TIMEOUT
+
+        while True:
             if self._cancelled.is_set():
                 return
             if self._all_files_acked():
                 self._success = True  # 所有文件确认完成
                 self._on_status.emit("发送完成 ✓")
                 return
+
+            if time.time() - self._last_activity > idle_timeout:
+                break
 
             try:
                 file_idx, seqs = self._retransmit_queue.get(timeout=1.0)
@@ -292,8 +319,9 @@ class _SendWorker:
 
             log.log(TAG, f"Retransmit: file idx={file_idx}, {len(seqs)} chunks")
             self._resend_chunks(file_idx, seqs)
+            self._last_activity = time.time()
 
-        log.warn(TAG, f"ACK/retransmit timeout for task {self._tid}")
+        log.warn(TAG, f"ACK/retransmit idle timeout for task {self._tid}")
         self._on_status.emit("发送完成（部分未确认）")
 
     def _resend_chunks(self, file_idx: int, seqs: list) -> None:
@@ -313,6 +341,10 @@ class _SendWorker:
                         break
                     header = CHUNK_HEADER.pack(self._tid, file_idx, seq)
                     self._send_cb(MSG_FILE_CHUNK, self._target, header + data)
+                    # 【bug修复】重传同样更新在途字节与文件进度，保证蓄水池/进度统计准确
+                    with self._lock:
+                        self._sent_total += len(data)
+                        fi["recv"] = min(fi.get("recv", 0) + len(data), fi["size"])
             # 重发 EOF，让接收方重新检查完整性
             header = CHUNK_HEADER.pack(self._tid, file_idx, EOF_SEQ)
             self._send_cb(MSG_FILE_CHUNK, self._target, header)
